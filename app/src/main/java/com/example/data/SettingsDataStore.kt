@@ -65,6 +65,9 @@ class SettingsDataStore(private val context: Context) {
         val BACKLIGHT_MODE = stringPreferencesKey("backlight_mode")
         val BACKLIGHT_DEHAZE = floatPreferencesKey("backlight_dehaze")
         val BACKLIGHT_CLARITY = floatPreferencesKey("backlight_clarity")
+        val FACE_DETECTION = booleanPreferencesKey("face_detection")
+        val FACE_DEBLUR = booleanPreferencesKey("face_deblur")
+        val MOTION_DEBLUR_STRENGTH = floatPreferencesKey("motion_deblur_strength")
     }
 
     val preferencesFlow: Flow<PersistedCameraPreferences> = context.cameraDataStore.data.map { prefs ->
@@ -103,6 +106,9 @@ class SettingsDataStore(private val context: Context) {
             prefs[Keys.BACKLIGHT_MODE] = updated.hdrConfig.backlightMode.name
             prefs[Keys.BACKLIGHT_DEHAZE] = updated.hdrConfig.backlightDehazeStrength
             prefs[Keys.BACKLIGHT_CLARITY] = updated.hdrConfig.backlightShadowClarity
+            prefs[Keys.FACE_DETECTION] = updated.hdrConfig.faceDetectionEnabled
+            prefs[Keys.FACE_DEBLUR] = updated.hdrConfig.faceDeblurEnabled
+            prefs[Keys.MOTION_DEBLUR_STRENGTH] = updated.hdrConfig.motionDeblurStrength
         }
     }
 
@@ -138,6 +144,9 @@ class SettingsDataStore(private val context: Context) {
                     ?: BacklightMode.AUTO,
                 backlightDehazeStrength = prefs[Keys.BACKLIGHT_DEHAZE] ?: 0.65f,
                 backlightShadowClarity = prefs[Keys.BACKLIGHT_CLARITY] ?: 0.55f,
+                faceDetectionEnabled = prefs[Keys.FACE_DETECTION] ?: true,
+                faceDeblurEnabled = prefs[Keys.FACE_DEBLUR] ?: true,
+                motionDeblurStrength = prefs[Keys.MOTION_DEBLUR_STRENGTH] ?: 0.72f,
             )
         )
     }

@@ -1250,4 +1250,229 @@ class ExampleRobolectricTest {
         backlitFrame.recycle()
         result.bitmap.recycle()
     }
+
+    @Test
+    fun `face coordinate mapper transforms back front zoom and smooths cleanly`() {
+        // Back camera (sensorOrientation=90, unmirrored), sensor active array 4000x3000 (4:3)
+        // A face near top-center of upright portrait sits at low sensor X, middle sensor Y
+        val backFace = com.example.camera.model.FaceCoordinateMapper.mapSensorRectToNormalizedUpright(
+            faceLeft = 400,
+            faceTop = 1000,
+            faceRight = 1200,
+            faceBottom = 2000,
+            cropLeft = 0,
+            cropTop = 0,
+            cropRight = 4000,
+            cropBottom = 3000,
+            sensorOrientationDegrees = 90,
+            mirrorHorizontally = false,
+            targetUprightAspect = 3f / 4f,
+            faceId = 7,
+            score = 92,
+        )
+        assertTrue(backFace != null)
+        // Sensor X [0.1, 0.3] -> upright Y [0.1, 0.3]; sensor Y [0.333, 0.667] -> upright X [0.333, 0.667]
+        assertEquals(0.10f, backFace!!.top, 0.02f)
+        assertEquals(0.30f, backFace.bottom, 0.02f)
+        assertEquals(0.333f, backFace.left, 0.02f)
+        assertEquals(0.667f, backFace.right, 0.02f)
+
+        // Front camera (sensorOrientation=270, mirrored for selfie preview)
+        val frontFace = com.example.camera.model.FaceCoordinateMapper.mapSensorRectToNormalizedUpright(
+            faceLeft = 2400,
+            faceTop = 600,
+            faceRight = 3200,
+            faceBottom = 1500,
+            cropLeft = 0,
+            cropTop = 0,
+            cropRight = 4000,
+            cropBottom = 3000,
+            sensorOrientationDegrees = 270,
+            mirrorHorizontally = true,
+            targetUprightAspect = 3f / 4f,
+            faceId = 3,
+            score = 88,
+        )
+        assertTrue(frontFace != null)
+        // Sensor X [0.6, 0.8] -> upright Y [0.2, 0.4]; sensor Y [0.2, 0.5] -> mirrored X [0.5, 0.8]
+        assertEquals(0.20f, frontFace!!.top, 0.02f)
+        assertEquals(0.40f, frontFace.bottom, 0.02f)
+        assertEquals(0.50f, frontFace.left, 0.02f)
+        assertEquals(0.80f, frontFace.right, 0.02f)
+
+        // Exponential smoothing interpolates smoothly toward new position
+        val moved = backFace.copy(left = backFace.left + 0.10f, right = backFace.right + 0.10f)
+        val smoothed = com.example.camera.model.FaceCoordinateMapper.smoothFaces(
+            previous = listOf(backFace),
+            current = listOf(moved),
+            alpha = 0.5f,
+        )
+        assertEquals(1, smoothed.size)
+        assertEquals(backFace.left + 0.05f, smoothed[0].left, 0.005f)
+    }
+
+    @Test
+    fun `face-aware backlight detection triggers when face is dark against bright surround`() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val vm = com.example.ui.viewmodel.CameraViewModel(app)
+
+        // Global scene looks balanced (only 2% clipped highlights, 6% crushed shadows, 0.56 mean luma),
+        // which would NOT trigger global backlight detection alone...
+        assertFalse(
+            com.example.camera.model.LowLightDetector.isBacklitScene(
+                clippedHighlightPercent = 2.2f,
+                crushedShadowPercent = 6f,
+                meanLuma = 0.56f,
+                faceMeanLuma = null,
+            )
+        )
+
+        // ...but when a detected face is dark (0.28 luma) against the 0.56 surround, backlight activates!
+        vm.updateLowLightDetection(
+            meanLuma = 0.56f,
+            crushedShadowPercent = 6f,
+            clippedHighlightPercent = 2.2f,
+            faceMeanLuma = 0.28f,
+        )
+        assertTrue(vm.uiState.value.isBacklitDetected)
+        assertTrue(vm.uiState.value.isBacklightActive)
+    }
+
+    @Test
+    fun `motion deblur restores edge sharpness on both regular and backlit face photos`() = runTest {
+        val engine = HdrPlusEngine()
+        val w = 96
+        val h = 96
+
+        // Measures true edge steepness (RMS gradient + Laplacian sharpness) rather than L1 telescoping sum
+        fun measureEdgeSteepness(bmp: Bitmap, x0: Int, x1: Int, y0: Int, y1: Int): Float {
+            var sumSq = 0.0
+            var count = 0
+            for (y in y0 until y1) {
+                for (x in x0 until x1) {
+                    val c = Color.red(bmp.getPixel(x, y)).toDouble()
+                    val r = Color.red(bmp.getPixel((x + 1).coerceAtMost(w - 1), y)).toDouble()
+                    val d = Color.red(bmp.getPixel(x, (y + 1).coerceAtMost(h - 1))).toDouble()
+                    val gx = r - c
+                    val gy = d - c
+                    sumSq += gx * gx + gy * gy
+                    count++
+                }
+            }
+            return kotlin.math.sqrt(sumSq / count.coerceAtLeast(1)).toFloat()
+        }
+
+        // 1. Regular photo with synthetic horizontal motion blur (5-tap horizontal box blur of vertical stripes)
+        val sharpRegular = Array(h) {
+            IntArray(w) { x ->
+                if ((x / 8) % 2 == 0) 200 else 60
+            }
+        }
+        val blurredRegularBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
+            for (y in 0 until h) {
+                for (x in 0 until w) {
+                    var acc = 0
+                    for (dx in -2..2) acc += sharpRegular[y][(x + dx).coerceIn(0, w - 1)]
+                    val v = (acc / 5).coerceIn(0, 255)
+                    setPixel(x, y, Color.rgb(v, v, v))
+                }
+            }
+        }
+
+        val regularNoDeblur = engine.processBurst(
+            frames = listOf(blurredRegularBmp),
+            mode = CameraMode.CAMERA,
+            hdrMode = HdrMode.HDR_PLUS_ENHANCED,
+            manual = ManualExposureSettings(),
+            config = HdrPipelineConfig(faceDeblurEnabled = false, sabreSharpening = 0f, cinematicEffectEnabled = false),
+            isBacklightActive = false,
+        )
+        val regularDeblurred = engine.processBurst(
+            frames = listOf(blurredRegularBmp),
+            mode = CameraMode.CAMERA,
+            hdrMode = HdrMode.HDR_PLUS_ENHANCED,
+            manual = ManualExposureSettings(),
+            config = HdrPipelineConfig(faceDeblurEnabled = true, motionDeblurStrength = 0.85f, sabreSharpening = 0f, cinematicEffectEnabled = false),
+            isBacklightActive = false,
+        )
+
+        val steepnessBefore = measureEdgeSteepness(regularNoDeblur.bitmap, 12, w - 12, 12, h - 12)
+        val steepnessAfter = measureEdgeSteepness(regularDeblurred.bitmap, 12, w - 12, 12, h - 12)
+        assertTrue("Expected regular photo motion deblur to apply", regularDeblurred.metrics.motionDeblurApplied > 0.10f)
+        assertTrue(
+            "Expected deblurred regular photo edge steepness ($steepnessAfter) > baseline ($steepnessBefore)",
+            steepnessAfter > steepnessBefore * 1.08f,
+        )
+
+        // 2. Backlit portrait burst: Frame 0 has sharp background but blurred face; Frame 1 has sharp backlit face
+        val face = com.example.camera.model.DetectedFace(
+            id = 1,
+            left = 0.25f,
+            top = 0.25f,
+            right = 0.75f,
+            bottom = 0.75f,
+            score = 95,
+        )
+        val frameBlurryFace = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
+            for (y in 0 until h) {
+                for (x in 0 until w) {
+                    val inFace = x in 24..72 && y in 24..72
+                    val v = if (inFace) {
+                        // Blurry soft face features
+                        52 + ((x / 6) % 2) * 8
+                    } else {
+                        // Crisp bright backlit background
+                        if ((x + y) % 2 == 0) 248 else 200
+                    }
+                    setPixel(x, y, Color.rgb(v, v, v))
+                }
+            }
+        }
+        val frameSharpFace = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
+            for (y in 0 until h) {
+                for (x in 0 until w) {
+                    val inFace = x in 24..72 && y in 24..72
+                    val v = if (inFace) {
+                        // Crisp high-contrast eyes/brows/features in shadowed backlit face
+                        if ((x % 4 < 2) && (y in 36..58)) 96 else 36
+                    } else {
+                        246
+                    }
+                    setPixel(x, y, Color.rgb(v, v, v))
+                }
+            }
+        }
+
+        val backlitFaceResult = engine.processBurst(
+            frames = listOf(frameBlurryFace, frameSharpFace),
+            mode = CameraMode.CAMERA,
+            hdrMode = HdrMode.HDR_PLUS_ENHANCED,
+            manual = ManualExposureSettings(),
+            config = HdrPipelineConfig(
+                backlightMode = BacklightMode.ON,
+                faceDetectionEnabled = true,
+                faceDeblurEnabled = true,
+                motionDeblurStrength = 0.80f,
+            ),
+            isBacklightActive = true,
+            detectedFaces = listOf(face),
+        )
+
+        assertEquals(1, backlitFaceResult.metrics.facesDetected)
+        assertTrue(backlitFaceResult.metrics.faceDeblurApplied)
+        assertTrue(backlitFaceResult.metrics.isBacklightEnhanced)
+        val faceEnergyOut = measureEdgeSteepness(backlitFaceResult.bitmap, 26, 70, 34, 60)
+        val faceEnergyBlurry = measureEdgeSteepness(frameBlurryFace, 26, 70, 34, 60)
+        assertTrue(
+            "Expected face-priority burst selection + backlit deblur ($faceEnergyOut) >> blurry face ($faceEnergyBlurry)",
+            faceEnergyOut > faceEnergyBlurry * 2.0f,
+        )
+
+        blurredRegularBmp.recycle()
+        regularNoDeblur.bitmap.recycle()
+        regularDeblurred.bitmap.recycle()
+        frameBlurryFace.recycle()
+        frameSharpFace.recycle()
+        backlitFaceResult.bitmap.recycle()
+    }
 }

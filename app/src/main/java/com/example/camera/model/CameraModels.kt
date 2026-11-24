@@ -350,7 +350,160 @@ data class HdrPipelineConfig(
     val backlightMode: BacklightMode = BacklightMode.AUTO,
     val backlightDehazeStrength: Float = 0.65f,
     val backlightShadowClarity: Float = 0.55f,
+    val faceDetectionEnabled: Boolean = true,
+    val faceDeblurEnabled: Boolean = true,
+    val motionDeblurStrength: Float = 0.72f,
 )
+
+/**
+ * Face bounding box normalized to [0f, 1f] in upright preview / captured-image coordinates.
+ */
+@Immutable
+data class DetectedFace(
+    val id: Int,
+    val left: Float,
+    val top: Float,
+    val right: Float,
+    val bottom: Float,
+    val score: Int = 80,
+) {
+    val width: Float get() = (right - left).coerceAtLeast(0f)
+    val height: Float get() = (bottom - top).coerceAtLeast(0f)
+    val centerX: Float get() = (left + right) * 0.5f
+    val centerY: Float get() = (top + bottom) * 0.5f
+    val area: Float get() = width * height
+
+    fun contains(normX: Float, normY: Float, padFraction: Float = 0f): Boolean {
+        val padX = width * padFraction
+        val padY = height * padFraction
+        return normX >= (left - padX) && normX <= (right + padX) &&
+            normY >= (top - padY) && normY <= (bottom + padY)
+    }
+}
+
+/**
+ * Pure coordinate transformer mapping Camera2 sensor-space face rectangles into normalized
+ * [0f, 1f] upright viewfinder & captured-image coordinates, accounting for digital zoom crop,
+ * sensor orientation, aspect-ratio center-crop, and front-camera mirroring.
+ */
+object FaceCoordinateMapper {
+    fun mapSensorRectToNormalizedUpright(
+        faceLeft: Int,
+        faceTop: Int,
+        faceRight: Int,
+        faceBottom: Int,
+        cropLeft: Int,
+        cropTop: Int,
+        cropRight: Int,
+        cropBottom: Int,
+        sensorOrientationDegrees: Int,
+        mirrorHorizontally: Boolean,
+        targetUprightAspect: Float? = null,
+        faceId: Int = 0,
+        score: Int = 80,
+    ): DetectedFace? {
+        val cropW = (cropRight - cropLeft).toFloat()
+        val cropH = (cropBottom - cropTop).toFloat()
+        if (cropW <= 1f || cropH <= 1f) return null
+
+        val sx1 = ((faceLeft - cropLeft) / cropW).coerceIn(-0.25f, 1.25f)
+        val sy1 = ((faceTop - cropTop) / cropH).coerceIn(-0.25f, 1.25f)
+        val sx2 = ((faceRight - cropLeft) / cropW).coerceIn(-0.25f, 1.25f)
+        val sy2 = ((faceBottom - cropTop) / cropH).coerceIn(-0.25f, 1.25f)
+
+        fun rotateSensorPoint(sx: Float, sy: Float): Pair<Float, Float> {
+            val (rx, ry) = when (((sensorOrientationDegrees % 360) + 360) % 360) {
+                90 -> (1f - sy) to sx
+                180 -> (1f - sx) to (1f - sy)
+                270 -> sy to (1f - sx)
+                else -> sx to sy
+            }
+            val mx = if (mirrorHorizontally) 1f - rx else rx
+            return mx to ry
+        }
+
+        val (ux1, uy1) = rotateSensorPoint(sx1, sy1)
+        val (ux2, uy2) = rotateSensorPoint(sx2, sy2)
+
+        var left = minOf(ux1, ux2)
+        var right = maxOf(ux1, ux2)
+        var top = minOf(uy1, uy2)
+        var bottom = maxOf(uy1, uy2)
+
+        // Apply FILL_CENTER aspect-ratio crop when preview/output aspect differs from sensor crop aspect
+        if (targetUprightAspect != null && targetUprightAspect > 0.1f) {
+            val rotated90or270 = (((sensorOrientationDegrees % 360) + 360) % 360) in listOf(90, 270)
+            val uprightCropAspect = if (rotated90or270) (cropH / cropW) else (cropW / cropH)
+            if (uprightCropAspect > 0.1f) {
+                if (targetUprightAspect < uprightCropAspect - 0.01f) {
+                    val scaleX = uprightCropAspect / targetUprightAspect
+                    left = (left - 0.5f) * scaleX + 0.5f
+                    right = (right - 0.5f) * scaleX + 0.5f
+                } else if (targetUprightAspect > uprightCropAspect + 0.01f) {
+                    val scaleY = targetUprightAspect / uprightCropAspect
+                    top = (top - 0.5f) * scaleY + 0.5f
+                    bottom = (bottom - 0.5f) * scaleY + 0.5f
+                }
+            }
+        }
+
+        val cl = left.coerceIn(0f, 1f)
+        val ct = top.coerceIn(0f, 1f)
+        val cr = right.coerceIn(0f, 1f)
+        val cb = bottom.coerceIn(0f, 1f)
+        if ((cr - cl) < 0.025f || (cb - ct) < 0.025f) return null
+
+        return DetectedFace(
+            id = faceId,
+            left = cl,
+            top = ct,
+            right = cr,
+            bottom = cb,
+            score = score.coerceIn(0, 100),
+        )
+    }
+
+    /**
+     * Exponentially smooths detected faces by matching IDs or nearest centroid so viewfinder
+     * reticles track smoothly at 60–120fps without jitter.
+     */
+    fun smoothFaces(
+        previous: List<DetectedFace>,
+        current: List<DetectedFace>,
+        alpha: Float = 0.42f,
+    ): List<DetectedFace> {
+        if (current.isEmpty()) return emptyList()
+        if (previous.isEmpty()) return current.sortedByDescending { it.area }.take(5)
+        val clampedAlpha = alpha.coerceIn(0.15f, 1f)
+        return current
+            .sortedByDescending { it.area }
+            .take(5)
+            .map { face ->
+                val match = previous.firstOrNull { it.id >= 0 && it.id == face.id }
+                    ?: previous.minByOrNull { prev ->
+                        val dx = prev.centerX - face.centerX
+                        val dy = prev.centerY - face.centerY
+                        dx * dx + dy * dy
+                    }?.takeIf { prev ->
+                        val dx = prev.centerX - face.centerX
+                        val dy = prev.centerY - face.centerY
+                        (dx * dx + dy * dy) <= 0.04f
+                    }
+                if (match == null) {
+                    face
+                } else {
+                    DetectedFace(
+                        id = face.id,
+                        left = match.left + (face.left - match.left) * clampedAlpha,
+                        top = match.top + (face.top - match.top) * clampedAlpha,
+                        right = match.right + (face.right - match.right) * clampedAlpha,
+                        bottom = match.bottom + (face.bottom - match.bottom) * clampedAlpha,
+                        score = face.score,
+                    )
+                }
+            }
+    }
+}
 
 @Immutable
 data class LensOption(
@@ -408,6 +561,9 @@ data class HdrProcessMetrics(
     val totalExposureSeconds: Float = 0f,
     val isBacklightEnhanced: Boolean = false,
     val backlightDehazeApplied: Float = 0f,
+    val facesDetected: Int = 0,
+    val faceDeblurApplied: Boolean = false,
+    val motionDeblurApplied: Float = 0f,
 )
 
 @Immutable
@@ -429,6 +585,8 @@ data class CapturedPhotoRecord(
     val isUltraHdr: Boolean = false,
     val isNightSight: Boolean = false,
     val isBacklightEnhanced: Boolean = false,
+    val facesDetected: Int = 0,
+    val isDeblurEnhanced: Boolean = false,
     val lumaHistogram: List<Int> = emptyList(),
 )
 
@@ -593,16 +751,23 @@ object LowLightDetector {
 
     /**
      * Detects strongly backlit / high-dynamic-range scenes where a bright light behind the subject
-     * simultaneously clips highlights while leaving the subject's front shadows crushed.
+     * simultaneously clips highlights while leaving the subject's front shadows crushed — OR when
+     * a detected face is significantly darker than the surrounding scene/highlights.
      */
     fun isBacklitScene(
         clippedHighlightPercent: Float,
         crushedShadowPercent: Float,
         meanLuma: Float,
+        faceMeanLuma: Float? = null,
     ): Boolean {
         val strongSplit = clippedHighlightPercent >= 3.5f && crushedShadowPercent >= 16f
         val extremeBacklight = clippedHighlightPercent >= 6.5f && crushedShadowPercent >= 10f && meanLuma < 0.62f
-        return strongSplit || extremeBacklight
+        val backlitFace = if (faceMeanLuma != null) {
+            val faceMuchDarkerThanBg = faceMeanLuma < 0.38f && (meanLuma - faceMeanLuma) >= 0.16f
+            val darkFaceWithBrightBg = faceMeanLuma < 0.42f && clippedHighlightPercent >= 1.8f
+            faceMuchDarkerThanBg || darkFaceWithBrightBg
+        } else false
+        return strongSplit || extremeBacklight || backlitFace
     }
 }
 

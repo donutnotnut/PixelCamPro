@@ -131,6 +131,8 @@ class MediaStoreRepository(private val context: Context) {
                 isUltraHdr = isUltraHdr,
                 isNightSight = metrics.isNightSight,
                 isBacklightEnhanced = metrics.isBacklightEnhanced,
+                facesDetected = metrics.facesDetected,
+                isDeblurEnhanced = metrics.faceDeblurApplied || metrics.motionDeblurApplied > 0.08f,
                 lumaHistogram = lumaHistogram,
             )
         } catch (ce: kotlinx.coroutines.CancellationException) {

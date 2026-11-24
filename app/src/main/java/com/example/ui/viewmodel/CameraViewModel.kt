@@ -17,6 +17,7 @@ import com.example.camera.model.AspectRatioMode
 import com.example.camera.model.BacklightMode
 import com.example.camera.model.CameraMode
 import com.example.camera.model.CapturedPhotoRecord
+import com.example.camera.model.DetectedFace
 import com.example.camera.model.FlashMode
 import com.example.camera.model.GridOverlayType
 import com.example.camera.model.HdrMode
@@ -95,6 +96,7 @@ data class CameraUiState(
     val isAnalysisActiveInSession: Boolean = true,
     val isLowLightDetected: Boolean = false,
     val isBacklitDetected: Boolean = false,
+    val detectedFaceCount: Int = 0,
     val lowLightSeverity: Float = 0f,
     val estimatedNightHoldSeconds: Float = 0f,
     val isLowLightBoostActive: Boolean = false,
@@ -263,6 +265,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private val _histogramState = MutableStateFlow(LiveFrameAnalysisResult())
     val histogramState: StateFlow<LiveFrameAnalysisResult> = _histogramState.asStateFlow()
 
+    private val _detectedFacesState = MutableStateFlow<List<DetectedFace>>(emptyList())
+    val detectedFacesState: StateFlow<List<DetectedFace>> = _detectedFacesState.asStateFlow()
+
     private var cachedPrefs: PersistedCameraPreferences = PersistedCameraPreferences()
     private var prefsLoaded = false
     private var persistPrefsJob: Job? = null
@@ -293,6 +298,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val isPixelExtensionCapture: Boolean = false,
         val pixelExtensionMode: PixelExtensionMode = PixelExtensionMode.NONE,
         val isBacklightActive: Boolean = false,
+        val detectedFaces: List<DetectedFace> = emptyList(),
     )
 
     private val renderQueue = Channel<PendingRenderJob>(capacity = MAX_PENDING_RENDERS)
@@ -463,6 +469,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 totalExposureSeconds = job.totalExposureSeconds,
                 isPixelExtensionCapture = job.isPixelExtensionCapture,
                 isBacklightActive = job.isBacklightActive,
+                detectedFaces = job.detectedFaces,
             )
             processedBitmap = processed.bitmap
 
@@ -501,6 +508,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         }
                     )
                 }
+                val deblurTag = when {
+                    processed.metrics.faceDeblurApplied -> " • Face Deblur"
+                    processed.metrics.motionDeblurApplied >= 0.25f -> " • Deblur"
+                    else -> ""
+                }
                 if (job.isPixelExtensionCapture) {
                     val extTag = job.pixelExtensionMode.badge.ifBlank { "Pixel Services" }
                     showBanner("$extTag • ${processed.metrics.processingTimeMs}ms")
@@ -512,12 +524,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 } else if (processed.metrics.isBacklightEnhanced) {
                     val hdrTag = if (record.isUltraHdr) "UHDR" else job.hdrMode.badge
                     showBanner(
-                        "$hdrTag • Backlight Photo • ${processed.metrics.framesMerged}f • ${processed.metrics.processingTimeMs}ms"
+                        "$hdrTag • Backlight$deblurTag • ${processed.metrics.framesMerged}f • ${processed.metrics.processingTimeMs}ms"
                     )
                 } else {
                     val hdrTag = if (record.isUltraHdr) "UHDR" else job.hdrMode.badge
                     showBanner(
-                        "$hdrTag • ${processed.metrics.framesMerged}f • ${processed.metrics.processingTimeMs}ms"
+                        "$hdrTag$deblurTag • ${processed.metrics.framesMerged}f • ${processed.metrics.processingTimeMs}ms"
                     )
                 }
             } else {
@@ -621,6 +633,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     pixelCameraServicesEnabled = state.pixelCameraServicesEnabled,
                     requestedExtensionMode = requestedExtMode,
                     nativeUltraHdrRequested = wantsNativeUltraHdr,
+                    faceDetectionEnabled = state.hdrConfig.faceDetectionEnabled,
                     isHistogramVisible = {
                         val s = _uiState.value
                         s.showHistogram && s.isAnalysisActiveInSession && !s.isSettingsSheetOpen && !s.isInspectorOpen
@@ -632,6 +645,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     onLowLightBoostStateChanged = { boosting ->
                         _uiState.update { it.copy(isLowLightBoostActive = boosting) }
                     },
+                    onFacesDetected = { faces ->
+                        _detectedFacesState.value = faces
+                        if (_uiState.value.detectedFaceCount != faces.size) {
+                            _uiState.update { it.copy(detectedFaceCount = faces.size) }
+                        }
+                    },
                     onLiveAnalysis = { analysis ->
                         _histogramState.value = analysis
                         val (hwIso, hwExpNs) = cameraController.getLatestHardwareExposure()
@@ -641,6 +660,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                             clippedHighlightPercent = analysis.clippedHighlightPercent,
                             sensorIso = hwIso,
                             exposureTimeNs = hwExpNs,
+                            faceMeanLuma = analysis.faceMeanLuma,
                         )
                     },
                 )
@@ -726,6 +746,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         sensorIso: Int? = null,
         exposureTimeNs: Long? = null,
         clippedHighlightPercent: Float = 0f,
+        faceMeanLuma: Float? = null,
     ) {
         val rawSeverity = LowLightDetector.computeSeverity(
             meanLuma = meanLuma,
@@ -749,6 +770,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             clippedHighlightPercent = clippedHighlightPercent,
             crushedShadowPercent = crushedShadowPercent,
             meanLuma = meanLuma,
+            faceMeanLuma = faceMeanLuma,
         )
 
         val effectiveSeverity = when {
@@ -1496,7 +1518,16 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun updatePreferences(transform: (PersistedCameraPreferences) -> PersistedCameraPreferences) {
+        val prevFaceDetect = _uiState.value.hdrConfig.faceDetectionEnabled
         persistPrefs(transform)
+        val nextFaceDetect = _uiState.value.hdrConfig.faceDetectionEnabled
+        if (nextFaceDetect != prevFaceDetect) {
+            cameraController.setFaceDetectionEnabled(nextFaceDetect)
+            if (!nextFaceDetect) {
+                _detectedFacesState.value = emptyList()
+                _uiState.update { it.copy(detectedFaceCount = 0) }
+            }
+        }
     }
 
     fun capturePhoto() {
@@ -1675,6 +1706,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     totalExposureSeconds = 0f
                 }
 
+                val captureFaces = if (effectiveHdrConfig.faceDetectionEnabled) {
+                    cameraController.getCaptureFaces(effectiveHdrConfig.mirrorFrontCamera)
+                } else emptyList()
                 val job = PendingRenderJob(
                     rawFrames = capturedFrames,
                     cameraMode = snapshot.cameraMode,
@@ -1692,6 +1726,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     isPixelExtensionCapture = usePixelExtensions,
                     pixelExtensionMode = activeExtMode,
                     isBacklightActive = snapshot.isBacklightActive,
+                    detectedFaces = captureFaces,
                 )
 
                 val sendResult = renderQueue.trySend(job)

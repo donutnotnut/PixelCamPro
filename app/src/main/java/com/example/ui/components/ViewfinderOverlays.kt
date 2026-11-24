@@ -67,12 +67,14 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.camera.hardware.HorizonOrientation
+import com.example.camera.model.DetectedFace
 import com.example.camera.model.GridOverlayType
 import com.example.camera.model.HdrMode
 import com.example.camera.model.LiveTelemetry
 import com.example.camera.model.ManualExposureSettings
 import com.example.camera.processing.LiveFrameAnalysisResult
 import com.example.ui.theme.FocusGreen
+import com.example.ui.theme.PixelAmber
 import com.example.ui.theme.ProTeal
 import com.example.ui.viewmodel.FocusReticleState
 import kotlinx.coroutines.flow.StateFlow
@@ -813,4 +815,101 @@ private fun HudDivider() {
             .height(10.dp)
             .background(MaterialTheme.colorScheme.outlineVariant),
     )
+}
+
+/**
+ * Pure-GPU viewfinder overlay rendering minimal Pixel-style rounded corner brackets around
+ * hardware-detected faces. Collects [facesFlow] in isolation so 15Hz face tracking never
+ * triggers recompositions of the parent camera screen.
+ */
+@Composable
+fun FaceDetectionOverlay(
+    facesFlow: StateFlow<List<DetectedFace>>,
+    isBacklit: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val faces by facesFlow.collectAsStateWithLifecycle()
+    val primaryColor by animateColorAsState(
+        targetValue = if (isBacklit) PixelAmber else Color.White.copy(alpha = 0.90f),
+        animationSpec = M3ExpressiveMotion.fastEffects(),
+        label = "face_box_color",
+    )
+
+    if (faces.isEmpty()) return
+
+    Canvas(
+        modifier = modifier
+            .fillMaxSize()
+            .testTag("face_detection_overlay")
+            .graphicsLayer {
+                compositingStrategy = CompositingStrategy.ModulateAlpha
+            },
+    ) {
+        val w = size.width
+        val h = size.height
+        val primaryStroke = 2.dp.toPx()
+        val secondaryStroke = 1.4.dp.toPx()
+
+        faces.forEachIndexed { idx, face ->
+            val left = (face.left * w).coerceIn(0f, w)
+            val top = (face.top * h).coerceIn(0f, h)
+            val right = (face.right * w).coerceIn(left, w)
+            val bottom = (face.bottom * h).coerceIn(top, h)
+            val boxW = right - left
+            val boxH = bottom - top
+            if (boxW < 18f || boxH < 18f) return@forEachIndexed
+
+            val isPrimary = idx == 0
+            val color = if (isPrimary) primaryColor else Color.White.copy(alpha = 0.55f)
+            val strokePx = if (isPrimary) primaryStroke else secondaryStroke
+            val cornerLen = (minOf(boxW, boxH) * 0.24f).coerceIn(10.dp.toPx(), 24.dp.toPx())
+            val cornerR = (cornerLen * 0.48f).coerceAtLeast(4.dp.toPx())
+
+            // Draw subtle rounded corner brackets (clean viewfinder look without obscuring faces)
+            // Top-Left
+            drawPath(
+                path = Path().apply {
+                    moveTo(left, top + cornerLen)
+                    lineTo(left, top + cornerR)
+                    quadraticTo(left, top, left + cornerR, top)
+                    lineTo(left + cornerLen, top)
+                },
+                color = color,
+                style = Stroke(width = strokePx, cap = StrokeCap.Round),
+            )
+            // Top-Right
+            drawPath(
+                path = Path().apply {
+                    moveTo(right - cornerLen, top)
+                    lineTo(right - cornerR, top)
+                    quadraticTo(right, top, right, top + cornerR)
+                    lineTo(right, top + cornerLen)
+                },
+                color = color,
+                style = Stroke(width = strokePx, cap = StrokeCap.Round),
+            )
+            // Bottom-Left
+            drawPath(
+                path = Path().apply {
+                    moveTo(left, bottom - cornerLen)
+                    lineTo(left, bottom - cornerR)
+                    quadraticTo(left, bottom, left + cornerR, bottom)
+                    lineTo(left + cornerLen, bottom)
+                },
+                color = color,
+                style = Stroke(width = strokePx, cap = StrokeCap.Round),
+            )
+            // Bottom-Right
+            drawPath(
+                path = Path().apply {
+                    moveTo(right - cornerLen, bottom)
+                    lineTo(right - cornerR, bottom)
+                    quadraticTo(right, bottom, right, bottom - cornerR)
+                    lineTo(right, bottom - cornerLen)
+                },
+                color = color,
+                style = Stroke(width = strokePx, cap = StrokeCap.Round),
+            )
+        }
+    }
 }

@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.Matrix
+import android.graphics.Rect
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraMetadata
@@ -45,6 +46,8 @@ import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.example.camera.model.AspectRatioMode
+import com.example.camera.model.DetectedFace
+import com.example.camera.model.FaceCoordinateMapper
 import com.example.camera.model.FlashMode
 import com.example.camera.model.HdrMode
 import com.example.camera.model.KelvinColorMath
@@ -136,6 +139,9 @@ data class HardwareCapabilities(
     val maxZoomRatio: Float = 8f,
     val activeFocalLengthMm35: Int = 24,
     val activeAperture: Float? = null,
+    val faceDetectMode: Int = CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF,
+    val sensorOrientation: Int = 90,
+    val sensorActiveArray: Rect? = null,
     val lensOptions: List<LensOption> = listOf(
         LensOption(id = "wide_1x", label = "1x", zoomRatio = 1f, focalLengthMm35 = 24),
         LensOption(id = "tele_2x", label = "2", zoomRatio = 2f, focalLengthMm35 = 48),
@@ -183,12 +189,55 @@ class CameraController(private val context: Context) {
     private var hasActiveCamera2Overrides: Boolean = false
     @Volatile
     private var lastAppliedEvIndex: Int? = null
+    @Volatile
+    private var activeFaceDetectMode: Int = CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF
+    @Volatile
+    private var activeSensorOrientation: Int = 90
+    @Volatile
+    private var activeSensorArray: Rect? = null
+    @Volatile
+    private var activeAspectRatioMode: AspectRatioMode = AspectRatioMode.RATIO_4_3
+    @Volatile
+    private var activeFaceDetectEnabled: Boolean = true
+    @Volatile
+    private var lastFaceEmitTimeMs: Long = 0L
+    @Volatile
+    private var smoothedFaces: List<DetectedFace> = emptyList()
+    @Volatile
+    private var onFacesDetectedCallback: ((List<DetectedFace>) -> Unit)? = null
 
     fun getLatestHardwareExposure(): Pair<Int?, Long?> {
         val effectiveIso = lastSensorIso?.let { iso ->
             (iso * (lastPostRawBoost.coerceIn(100, 1600) / 100.0)).roundToInt()
         }
         return effectiveIso to lastExposureTimeNs
+    }
+
+    /**
+     * Returns the latest tracked faces in upright normalized [0, 1] coordinates.
+     * When capturing a front-camera photo with [mirrorFrontCamera] disabled, flips X back so
+     * face ROIs align 1:1 with the unmirrored captured bitmap.
+     */
+    fun getCaptureFaces(mirrorFrontCamera: Boolean): List<DetectedFace> {
+        if (!activeFaceDetectEnabled) return emptyList()
+        val current = smoothedFaces
+        if (current.isEmpty()) return emptyList()
+        val isFront = currentLensFacing == CameraSelector.LENS_FACING_FRONT
+        if (!isFront || mirrorFrontCamera) return current
+        return current.map { f ->
+            f.copy(
+                left = (1f - f.right).coerceIn(0f, 1f),
+                right = (1f - f.left).coerceIn(0f, 1f),
+            )
+        }
+    }
+
+    fun setFaceDetectionEnabled(enabled: Boolean) {
+        activeFaceDetectEnabled = enabled
+        if (!enabled && smoothedFaces.isNotEmpty()) {
+            smoothedFaces = emptyList()
+            onFacesDetectedCallback?.invoke(emptyList())
+        }
     }
 
     fun getCapabilities(): HardwareCapabilities = currentCapabilities
@@ -204,14 +253,21 @@ class CameraController(private val context: Context) {
         pixelCameraServicesEnabled: Boolean = false,
         requestedExtensionMode: PixelExtensionMode = PixelExtensionMode.NONE,
         nativeUltraHdrRequested: Boolean = false,
+        faceDetectionEnabled: Boolean = true,
         isHistogramVisible: () -> Boolean = { true },
         isAnalysisPaused: () -> Boolean = { false },
         onLowLightBoostStateChanged: (Boolean) -> Unit = {},
+        onFacesDetected: (List<DetectedFace>) -> Unit = {},
         onLiveAnalysis: (LiveFrameAnalysisResult) -> Unit,
     ): HardwareCapabilities {
         val provider = getCameraProvider()
         cameraProvider = provider
         currentLensFacing = lensFacing
+        activeAspectRatioMode = aspectRatioMode
+        activeFaceDetectEnabled = faceDetectionEnabled
+        onFacesDetectedCallback = onFacesDetected
+        smoothedFaces = emptyList()
+        onFacesDetected(emptyList())
 
         val aspectRatio = when (aspectRatioMode) {
             AspectRatioMode.RATIO_4_3 -> AspectRatio.RATIO_4_3
@@ -328,10 +384,21 @@ class CameraController(private val context: Context) {
                 baseFacingSelector
             }
 
+            val (probedFaceMode, probedOrientation, probedArray) = probeFaceDetectConfig(provider, selector)
+            activeFaceDetectMode = probedFaceMode
+            activeSensorOrientation = probedOrientation
+            activeSensorArray = probedArray
+
             val previewBuilder = Preview.Builder()
                 .setResolutionSelector(resolutionSelector)
-            Camera2Interop.Extender(previewBuilder)
+            val previewExtender = Camera2Interop.Extender(previewBuilder)
                 .setSessionCaptureCallback(createPreviewTelemetryCallback())
+            if (probedFaceMode != CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF) {
+                previewExtender.setCaptureRequestOption(
+                    CaptureRequest.STATISTICS_FACE_DETECT_MODE,
+                    probedFaceMode,
+                )
+            }
             preview = previewBuilder
                 .build().also {
                     it.surfaceProvider = previewView.surfaceProvider
@@ -374,7 +441,16 @@ class CameraController(private val context: Context) {
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setResolutionSelector(analysisResolutionSelector)
                 .build().also {
-                    it.setAnalyzer(analysisExecutor, LiveFrameAnalyzer(isHistogramVisible, isAnalysisPaused, onLiveAnalysis))
+                    it.setAnalyzer(
+                        analysisExecutor,
+                        LiveFrameAnalyzer(
+                            isHistogramVisible = isHistogramVisible,
+                            isPaused = isAnalysisPaused,
+                            detectedFacesProvider = { if (activeFaceDetectEnabled) smoothedFaces else emptyList() },
+                            isFrontCameraProvider = { currentLensFacing == CameraSelector.LENS_FACING_FRONT },
+                            onAnalyzed = onLiveAnalysis,
+                        )
+                    )
                 }
 
             provider.unbindAll()
@@ -509,6 +585,27 @@ class CameraController(private val context: Context) {
         modes?.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON) == true
     }.getOrDefault(false)
 
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun probeFaceDetectConfig(
+        provider: ProcessCameraProvider,
+        selector: CameraSelector,
+    ): Triple<Int, Int, Rect?> = runCatching {
+        val info = selector.filter(provider.availableCameraInfos).firstOrNull()
+            ?: return@runCatching Triple(CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF, 90, null)
+        val c2Info = Camera2CameraInfo.from(info)
+        val modes = c2Info.getCameraCharacteristic(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES)
+        val preferredMode = when {
+            modes?.contains(CameraMetadata.STATISTICS_FACE_DETECT_MODE_SIMPLE) == true ->
+                CameraMetadata.STATISTICS_FACE_DETECT_MODE_SIMPLE
+            modes?.contains(CameraMetadata.STATISTICS_FACE_DETECT_MODE_FULL) == true ->
+                CameraMetadata.STATISTICS_FACE_DETECT_MODE_FULL
+            else -> CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF
+        }
+        val orientation = c2Info.getCameraCharacteristic(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        val activeArray = c2Info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        Triple(preferredMode, orientation, activeArray)
+    }.getOrDefault(Triple(CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF, 90, null))
+
     private fun createPreviewTelemetryCallback(): CameraCaptureSession.CaptureCallback =
         object : CameraCaptureSession.CaptureCallback() {
             override fun onCaptureCompleted(
@@ -527,6 +624,56 @@ class CameraController(private val context: Context) {
                 }
                 result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { expNs ->
                     if (expNs > 0L) lastExposureTimeNs = expNs
+                }
+
+                if (!activeFaceDetectEnabled) return
+                val now = System.currentTimeMillis()
+                if (now - lastFaceEmitTimeMs < 65L) return
+                lastFaceEmitTimeMs = now
+
+                val hwFaces = result.get(CaptureResult.STATISTICS_FACES)
+                val cropRect = result.get(CaptureResult.SCALER_CROP_REGION) ?: activeSensorArray
+                if (hwFaces.isNullOrEmpty() || cropRect == null) {
+                    if (smoothedFaces.isNotEmpty()) {
+                        smoothedFaces = emptyList()
+                        onFacesDetectedCallback?.invoke(emptyList())
+                    }
+                    return
+                }
+
+                val isFront = currentLensFacing == CameraSelector.LENS_FACING_FRONT
+                val targetUprightAspect = when (activeAspectRatioMode) {
+                    AspectRatioMode.RATIO_4_3 -> 3f / 4f
+                    AspectRatioMode.RATIO_16_9 -> 9f / 16f
+                }
+                val mapped = ArrayList<DetectedFace>(hwFaces.size)
+                for (i in hwFaces.indices) {
+                    val face = hwFaces[i]
+                    if (face.score < 42) continue
+                    val bounds = face.bounds ?: continue
+                    val normalized = FaceCoordinateMapper.mapSensorRectToNormalizedUpright(
+                        faceLeft = bounds.left,
+                        faceTop = bounds.top,
+                        faceRight = bounds.right,
+                        faceBottom = bounds.bottom,
+                        cropLeft = cropRect.left,
+                        cropTop = cropRect.top,
+                        cropRight = cropRect.right,
+                        cropBottom = cropRect.bottom,
+                        sensorOrientationDegrees = activeSensorOrientation,
+                        mirrorHorizontally = isFront,
+                        targetUprightAspect = targetUprightAspect,
+                        faceId = if (face.id >= 0) face.id else i,
+                        score = face.score,
+                    )
+                    if (normalized != null) {
+                        mapped.add(normalized)
+                    }
+                }
+                val nextFaces = FaceCoordinateMapper.smoothFaces(smoothedFaces, mapped, alpha = 0.44f)
+                if (nextFaces != smoothedFaces) {
+                    smoothedFaces = nextFaces
+                    onFacesDetectedCallback?.invoke(nextFaces)
                 }
             }
         }
@@ -661,6 +808,21 @@ class CameraController(private val context: Context) {
             val minFocusDist = c2Info.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
             val afModes = c2Info.getCameraCharacteristic(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
             val hasAutoFocus = minFocusDist > 0f && (afModes?.any { it != CameraMetadata.CONTROL_AF_MODE_OFF } ?: true)
+            val faceModes = c2Info.getCameraCharacteristic(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES)
+            val faceDetectMode = when {
+                faceModes?.contains(CameraMetadata.STATISTICS_FACE_DETECT_MODE_SIMPLE) == true ->
+                    CameraMetadata.STATISTICS_FACE_DETECT_MODE_SIMPLE
+                faceModes?.contains(CameraMetadata.STATISTICS_FACE_DETECT_MODE_FULL) == true ->
+                    CameraMetadata.STATISTICS_FACE_DETECT_MODE_FULL
+                else -> CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF
+            }
+            val sensorOrientation = c2Info.getCameraCharacteristic(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+            val sensorActiveArray = c2Info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            activeSensorOrientation = sensorOrientation
+            activeSensorArray = sensorActiveArray
+            if (activeExtensionMode == PixelExtensionMode.NONE) {
+                activeFaceDetectMode = faceDetectMode
+            }
 
             HardwareCapabilities(
                 rawSupported = rawSupported,
@@ -688,6 +850,9 @@ class CameraController(private val context: Context) {
                 maxZoomRatio = maxZoom,
                 activeFocalLengthMm35 = focal35,
                 activeAperture = aperture,
+                faceDetectMode = faceDetectMode,
+                sensorOrientation = sensorOrientation,
+                sensorActiveArray = sensorActiveArray,
                 lensOptions = discoveredLenses,
             )
         } catch (e: Exception) {

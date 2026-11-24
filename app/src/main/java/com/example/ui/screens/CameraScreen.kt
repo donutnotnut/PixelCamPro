@@ -17,6 +17,7 @@ import android.view.ViewGroup
 import android.view.ViewOutlineProvider
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.RequiresApi
 import androidx.camera.core.CameraSelector
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedContent
@@ -150,6 +151,7 @@ import com.example.ui.components.ExpressiveSegmentedGroup
 import com.example.ui.components.ExpressiveShapes
 import com.example.ui.components.ExpressiveSlider
 import com.example.ui.components.ExpressiveSurfacePanel
+import com.example.ui.components.FaceDetectionOverlay
 import com.example.ui.components.FocusReticleOverlay
 import com.example.ui.components.HorizonLevelOverlay
 import com.example.ui.components.LiveHistogramWidget
@@ -286,6 +288,7 @@ fun CameraRoute(
     }
 }
 
+@RequiresApi(Build.VERSION_CODES.HONEYCOMB)
 @Composable
 private fun CameraScreenContent(
     uiState: CameraUiState,
@@ -597,6 +600,13 @@ private fun CameraScreenContent(
                     )
                 }
 
+                if (uiState.hdrConfig.faceDetectionEnabled && !uiState.isSettingsSheetOpen && !uiState.isInspectorOpen) {
+                    FaceDetectionOverlay(
+                        facesFlow = viewModel.detectedFacesState,
+                        isBacklit = uiState.isBacklightActive,
+                    )
+                }
+
                 FocusReticleOverlay(
                     reticle = uiState.focusReticle,
                     evValue = uiState.manualSettings.exposureCompensationEv,
@@ -899,9 +909,10 @@ private fun CameraScreenContent(
                         .align(Alignment.BottomCenter)
                         .padding(bottom = 66.dp),
                 ) {
+                    val hasFace = uiState.detectedFaceCount > 0
                     val label = when (uiState.hdrConfig.backlightMode) {
-                        BacklightMode.ON -> "Backlight On • Anti-Glare Active"
-                        BacklightMode.AUTO -> "Backlight Scene • Anti-Glare Active"
+                        BacklightMode.ON -> if (hasFace) "Backlight Face • Anti-Glare & Deblur" else "Backlight On • Anti-Glare Active"
+                        BacklightMode.AUTO -> if (hasFace) "Backlight Face • Anti-Glare & Deblur" else "Backlight Scene • Anti-Glare Active"
                         BacklightMode.OFF -> "Backlight Off"
                     }
                     Surface(

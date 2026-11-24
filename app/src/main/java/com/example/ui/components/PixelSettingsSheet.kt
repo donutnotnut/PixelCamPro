@@ -30,8 +30,10 @@ import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.AutoFixHigh
 import androidx.compose.material.icons.rounded.BurstMode
 import androidx.compose.material.icons.rounded.CenterFocusStrong
+import androidx.compose.material.icons.rounded.Deblur
 import androidx.compose.material.icons.rounded.Equalizer
 import androidx.compose.material.icons.rounded.ExpandMore
+import androidx.compose.material.icons.rounded.Face
 import androidx.compose.material.icons.rounded.Flip
 import androidx.compose.material.icons.rounded.GridOn
 import androidx.compose.material.icons.rounded.HdrEnhancedSelect
@@ -328,7 +330,7 @@ fun PixelSettingsSheet(
                         isPixelServicesLocked -> "Managed by Pixel Camera Services"
                         isNightSightActive -> "Disabled in Low Light"
                         else -> when (hdrConfig.backlightMode) {
-                            BacklightMode.AUTO -> "Auto (detects backlight)"
+                            BacklightMode.AUTO -> "Auto (detects backlight & backlit faces)"
                             BacklightMode.ON -> "Always On (anti-glare active)"
                             BacklightMode.OFF -> "Off"
                         }
@@ -339,6 +341,41 @@ fun PixelSettingsSheet(
                     accentContent = MaterialTheme.colorScheme.onSecondaryContainer,
                     enabled = backlightEnabled,
                     onClick = { showBacklightDialog = true },
+                )
+            }
+            item(key = "row_face_detection", contentType = "switch") {
+                PixelSwitchRow(
+                    icon = Icons.Rounded.Face,
+                    title = "Face detection",
+                    subtitle = "Hardware face tracking for backlit face lift & sharpest-face burst pick",
+                    checked = hdrConfig.faceDetectionEnabled,
+                    position = ExpressiveListPosition.MIDDLE,
+                    badgeShape = ExpressiveButtonShape.CIRCLE_TO_COOKIE,
+                    accentContainer = MaterialTheme.colorScheme.tertiaryContainer,
+                    accentContent = MaterialTheme.colorScheme.onTertiaryContainer,
+                    onCheckedChange = { enabled ->
+                        onUpdatePrefs { it.copy(hdrConfig = it.hdrConfig.copy(faceDetectionEnabled = enabled)) }
+                    },
+                )
+            }
+            item(key = "row_face_deblur", contentType = "switch") {
+                PixelSwitchRow(
+                    icon = Icons.Rounded.Deblur,
+                    title = "Face & motion deblur",
+                    subtitle = if (isPixelServicesLocked) {
+                        "Managed by Pixel Camera Services"
+                    } else {
+                        "Directional micro-blur deconvolution for regular & backlit photos"
+                    },
+                    checked = !isPixelServicesLocked && hdrConfig.faceDeblurEnabled,
+                    position = ExpressiveListPosition.MIDDLE,
+                    badgeShape = ExpressiveButtonShape.CIRCLE_TO_BURST,
+                    accentContainer = MaterialTheme.colorScheme.secondaryContainer,
+                    accentContent = MaterialTheme.colorScheme.onSecondaryContainer,
+                    enabled = !isPixelServicesLocked,
+                    onCheckedChange = { enabled ->
+                        onUpdatePrefs { it.copy(hdrConfig = it.hdrConfig.copy(faceDeblurEnabled = enabled)) }
+                    },
                 )
             }
             item(key = "row_burst", contentType = "picker") {
@@ -508,6 +545,13 @@ fun PixelSettingsSheet(
                                 value = hdrConfig.backlightShadowClarity,
                                 onValueChange = { v ->
                                     onUpdatePrefs { it.copy(hdrConfig = it.hdrConfig.copy(backlightShadowClarity = v)) }
+                                },
+                            )
+                            PixelSettingsSlider(
+                                title = "Motion & face deblur strength",
+                                value = hdrConfig.motionDeblurStrength,
+                                onValueChange = { v ->
+                                    onUpdatePrefs { it.copy(hdrConfig = it.hdrConfig.copy(motionDeblurStrength = v)) }
                                 },
                             )
                         }

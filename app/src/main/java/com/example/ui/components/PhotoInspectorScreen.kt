@@ -363,6 +363,19 @@ fun PhotoInspectorScreen(
                                     )
                                 }
                             }
+                            if (activeRecord.isDeblurEnhanced) {
+                                Surface(
+                                    shape = CircleShape,
+                                    color = MaterialTheme.colorScheme.secondaryContainer,
+                                ) {
+                                    Text(
+                                        text = if (activeRecord.metrics.faceDeblurApplied) "Face Deblur" else "Deblur",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                                    )
+                                }
+                            }
                             if (activeRecord.isUltraHdr) {
                                 Surface(
                                     shape = CircleShape,
