@@ -127,6 +127,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import com.example.R
 import com.example.camera.model.AspectRatioMode
+import com.example.camera.model.BacklightMode
 import com.example.camera.model.FlashMode
 import com.example.camera.model.HdrMode
 import com.example.camera.model.LensOption
@@ -867,6 +868,62 @@ private fun CameraScreenContent(
                         ) {
                             Icon(
                                 imageVector = Icons.Rounded.Bedtime,
+                                contentDescription = null,
+                                tint = PixelAmber,
+                                modifier = Modifier.size(15.dp),
+                            )
+                            Text(
+                                text = label,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = PixelAmber,
+                            )
+                        }
+                    }
+                }
+
+                // Pixel-style Backlight Picture Indicator Pill (Anti-Glare & Dehaze indicator)
+                val showBacklightPill = uiState.isBacklightActive &&
+                    !uiState.isNightSightActive &&
+                    bannerText == null &&
+                    !anyFloatingDrawerOpen &&
+                    !uiState.isZoomRulerVisible &&
+                    !uiState.isQuickSettingsExpanded
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = showBacklightPill,
+                    enter = fadeIn(tween(160)) +
+                        scaleIn(initialScale = 0.90f, animationSpec = M3ExpressiveMotion.fastSpatial()),
+                    exit = fadeOut(tween(120)) +
+                        scaleOut(targetScale = 0.92f, animationSpec = M3ExpressiveMotion.fastEffects()),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 66.dp),
+                ) {
+                    val label = when (uiState.hdrConfig.backlightMode) {
+                        BacklightMode.ON -> "Backlight On • Anti-Glare Active"
+                        BacklightMode.AUTO -> "Backlight Scene • Anti-Glare Active"
+                        BacklightMode.OFF -> "Backlight Off"
+                    }
+                    Surface(
+                        onClick = {
+                            haptics.tick()
+                            viewModel.toggleBacklightModeQuick()
+                        },
+                        shape = CircleShape,
+                        color = Color(0xCC201A12),
+                        tonalElevation = 0.dp,
+                        shadowElevation = 0.dp,
+                        modifier = Modifier
+                            .border(1.dp, PixelAmber.copy(alpha = 0.65f), CircleShape)
+                            .semantics(mergeDescendants = true) {}
+                            .testTag("backlight_indicator_pill"),
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.padding(horizontal = 13.dp, vertical = 7.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.WbSunny,
                                 contentDescription = null,
                                 tint = PixelAmber,
                                 modifier = Modifier.size(15.dp),

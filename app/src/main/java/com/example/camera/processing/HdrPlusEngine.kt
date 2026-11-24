@@ -68,6 +68,7 @@ class HdrPlusEngine {
         lowLightSeverity: Float = 0f,
         totalExposureSeconds: Float = 0f,
         isPixelExtensionCapture: Boolean = false,
+        isBacklightActive: Boolean = false,
     ): HdrProcessResult = withContext(Dispatchers.Default) {
         require(rawFrames.isNotEmpty()) { "At least one frame is required for processing" }
         val startNs = System.nanoTime()
@@ -157,6 +158,7 @@ class HdrPlusEngine {
                     totalExposureSeconds = totalExposureSeconds,
                     isPixelExtensionCapture = false,
                     nativeGainmap = nativeGainmap,
+                    isBacklightActive = isBacklightActive,
                 ).also {
                     nativeGainmap = null
                 }
@@ -203,6 +205,7 @@ class HdrPlusEngine {
                 totalExposureSeconds = totalExposureSeconds,
                 isPixelExtensionCapture = isPixelExtensionCapture,
                 nativeGainmap = nativeGainmap,
+                isBacklightActive = isBacklightActive,
             ).also {
                 nativeGainmap = null
             }
@@ -223,6 +226,7 @@ class HdrPlusEngine {
         totalExposureSeconds: Float = 0f,
         isPixelExtensionCapture: Boolean = false,
         exposureBiasEvs: FloatArray? = null,
+        isBacklightActive: Boolean = false,
     ): HdrProcessResult = withContext(Dispatchers.Default) {
         require(frames.isNotEmpty()) { "At least one frame is required for processing" }
         val startNs = System.nanoTime()
@@ -257,6 +261,7 @@ class HdrPlusEngine {
             lowLightSeverity = lowLightSeverity,
             totalExposureSeconds = totalExposureSeconds,
             isPixelExtensionCapture = isPixelExtensionCapture,
+            isBacklightActive = isBacklightActive,
         )
     }
 
@@ -272,6 +277,7 @@ class HdrPlusEngine {
         totalExposureSeconds: Float = 0f,
         isPixelExtensionCapture: Boolean = false,
         nativeGainmap: Gainmap? = null,
+        isBacklightActive: Boolean = false,
     ): HdrProcessResult {
         val hasZeroEvFrame = extracted.any { abs(it.exposureBiasEv) < 0.1f }
         var refIndex = 0
@@ -326,6 +332,7 @@ class HdrPlusEngine {
             totalExposureSeconds = totalExposureSeconds,
             isPixelExtensionCapture = isPixelExtensionCapture,
             nativeGainmap = nativeGainmap,
+            isBacklightActive = isBacklightActive,
         )
     }
 
@@ -343,6 +350,7 @@ class HdrPlusEngine {
         totalExposureSeconds: Float,
         isPixelExtensionCapture: Boolean = false,
         nativeGainmap: Gainmap? = null,
+        isBacklightActive: Boolean = false,
     ): HdrProcessResult {
         val totalPixels = width * height
 
@@ -401,10 +409,17 @@ class HdrPlusEngine {
             .coerceIn(-1f, 1f)
         val vibrancyAmount = (manual.vibrancyAdjust + if (cinematicOn) ToneColorMath.CINEMATIC_VIBRANCY_OFFSET else 0f + if (nightSightEnabled && !isPixelExtensionCapture) 0.14f else 0f)
             .coerceIn(-1f, 1f)
-        val localContrastStrength = (config.localToneMapping * hdrStrength * 0.24f).coerceIn(0f, 0.35f)
+        val baseLocalContrast = (config.localToneMapping * hdrStrength * 0.24f).coerceIn(0f, 0.35f)
+        val backlightClarityFactor = if (isBacklightActive && !nightSightEnabled) (config.backlightShadowClarity * 0.45f).coerceIn(0f, 0.65f) else 0f
+        val backlightDehazeFactor = if (isBacklightActive && !nightSightEnabled) (config.backlightDehazeStrength * 0.08f).coerceIn(0f, 0.12f) else 0f
+        val localContrastStrength = if (isBacklightActive && !nightSightEnabled) {
+            (baseLocalContrast * (1f + backlightClarityFactor * 0.65f)).coerceIn(0f, 0.45f)
+        } else baseLocalContrast
+
         val sharpenAmount = when {
             isPixelExtensionCapture -> 0f
             nightSightEnabled -> (config.sabreSharpening * 0.78f).coerceIn(0f, 0.90f)
+            isBacklightActive -> (config.sabreSharpening * (0.92f + backlightClarityFactor * 0.15f)).coerceIn(0f, 1.0f)
             else -> (config.sabreSharpening * 0.92f).coerceIn(0f, 1.0f)
         }
 
@@ -412,6 +427,8 @@ class HdrPlusEngine {
             shadowLift = shadowLiftAmount,
             highlightRecover = highlightRecoverBase,
             highlightAdjust = highlightAdjust,
+            backlightDehaze = backlightDehazeFactor,
+            backlightClarity = backlightClarityFactor,
         )
 
         val useLocalTone = localContrastStrength > 0.005f
@@ -679,8 +696,11 @@ class HdrPlusEngine {
                             val gauss3 = (tl + tr + bl + br + 2f * (tc + bc + ml + mr) + 4f * centerL) * (1f / 16f)
                             val fineDetail = centerL - gauss3
 
-                            // Noise-coring threshold avoids sharpening flat sensor grain while preserving crisp micro-texture
-                            val fineCoring = if (nightSightEnabled) 0.006f else 0.0028f
+                            // Noise-coring threshold: when backlit, lower coring on shadowed subject to preserve fine hair & skin micro-texture
+                            val baseFineCoring = if (nightSightEnabled) 0.006f else 0.0028f
+                            val fineCoring = if (isBacklightActive && centerL < 0.60f) {
+                                (baseFineCoring * (1f - backlightClarityFactor * 0.40f)).coerceAtLeast(0.0014f)
+                            } else baseFineCoring
                             val coredFine = if (abs(fineDetail) > fineCoring) fineDetail else 0f
 
                             // Subtle medium-scale (radius-2) optical micro-contrast
@@ -694,7 +714,10 @@ class HdrPlusEngine {
                                 if (abs(md) > medCoring) md * 0.30f else 0f
                             } else 0f
 
-                            val combinedDiff = coredFine * 1.75f + medDetail
+                            val subjectClarityMultiplier = if (isBacklightActive && centerL < 0.65f) {
+                                1f + backlightClarityFactor * (1f - centerL).coerceIn(0f, 1f) * 1.10f
+                            } else 1f
+                            val combinedDiff = (coredFine * 1.75f + medDetail) * subjectClarityMultiplier
                             if (combinedDiff != 0f) {
                                 val edgeMask = sharpenEdgeLut[(abs(fineDetail) * 255f).toInt().coerceIn(0, 255)]
                                 val minL = min(centerL, min(min(min(ml, mr), min(tc, bc)), min(min(tl, tr), min(bl, br))))
@@ -781,6 +804,8 @@ class HdrPlusEngine {
                 isUltraHdr = hasUltraHdrGainmap,
                 isNightSight = nightSightEnabled,
                 totalExposureSeconds = totalExposureSeconds,
+                isBacklightEnhanced = isBacklightActive && !nightSightEnabled,
+                backlightDehazeApplied = backlightDehazeFactor,
             ),
             lumaHistogram = histogramBins,
         )
@@ -1538,10 +1563,22 @@ class HdrPlusEngine {
         shadowLift: Float,
         highlightRecover: Float,
         highlightAdjust: Float,
+        backlightDehaze: Float = 0f,
+        backlightClarity: Float = 0f,
     ): FloatArray {
         val lut = FloatArray(256)
         for (idx in 0..255) {
             var v = idx / 255f
+
+            // Anti-veiling glare: re-anchor the black level if glare washed it out
+            if (backlightDehaze > 0.005f) {
+                val flareFloor = backlightDehaze * 0.65f
+                v = if (v > flareFloor) {
+                    ((v - flareFloor) / (1f - flareFloor)).coerceIn(0f, 1f)
+                } else {
+                    v * 0.5f // smoothly compress deepest blacks
+                }
+            }
 
             if (shadowLift > 0.001f) {
                 val w = (1f - v).pow(2.2f) * (1f - (1f - v).pow(4f))
@@ -1549,6 +1586,15 @@ class HdrPlusEngine {
             } else if (shadowLift < -0.001f) {
                 val w = (1f - v).pow(1.9f) * v
                 v += shadowLift * w * 1.15f
+            }
+
+            // Backlight subject fill with midtone contrast preservation (prevents soapy flat gray skin)
+            if (backlightClarity > 0.005f) {
+                val subjectWeight = if (v in 0.04f..0.70f) {
+                    val norm = (v - 0.04f) / 0.66f
+                    (norm * (1f - norm) * 4f).pow(1.2f)
+                } else 0f
+                v += backlightClarity * subjectWeight * 0.16f
             }
 
             if (highlightRecover > 0.01f && v > 0.45f) {

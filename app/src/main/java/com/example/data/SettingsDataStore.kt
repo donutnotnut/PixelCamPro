@@ -10,6 +10,7 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.camera.model.AspectRatioMode
+import com.example.camera.model.BacklightMode
 import com.example.camera.model.GridOverlayType
 import com.example.camera.model.HdrMode
 import com.example.camera.model.HdrPipelineConfig
@@ -61,6 +62,9 @@ class SettingsDataStore(private val context: Context) {
         val SABRE_SHARPENING = floatPreferencesKey("sabre_sharpening")
         val RAW_DNG = booleanPreferencesKey("raw_dng")
         val MIRROR_FRONT = booleanPreferencesKey("mirror_front")
+        val BACKLIGHT_MODE = stringPreferencesKey("backlight_mode")
+        val BACKLIGHT_DEHAZE = floatPreferencesKey("backlight_dehaze")
+        val BACKLIGHT_CLARITY = floatPreferencesKey("backlight_clarity")
     }
 
     val preferencesFlow: Flow<PersistedCameraPreferences> = context.cameraDataStore.data.map { prefs ->
@@ -96,6 +100,9 @@ class SettingsDataStore(private val context: Context) {
             prefs[Keys.SABRE_SHARPENING] = updated.hdrConfig.sabreSharpening
             prefs[Keys.RAW_DNG] = updated.hdrConfig.rawDngEnabled
             prefs[Keys.MIRROR_FRONT] = updated.hdrConfig.mirrorFrontCamera
+            prefs[Keys.BACKLIGHT_MODE] = updated.hdrConfig.backlightMode.name
+            prefs[Keys.BACKLIGHT_DEHAZE] = updated.hdrConfig.backlightDehazeStrength
+            prefs[Keys.BACKLIGHT_CLARITY] = updated.hdrConfig.backlightShadowClarity
         }
     }
 
@@ -127,6 +134,10 @@ class SettingsDataStore(private val context: Context) {
                 sabreSharpening = prefs[Keys.SABRE_SHARPENING] ?: 0.72f,
                 rawDngEnabled = prefs[Keys.RAW_DNG] ?: false,
                 mirrorFrontCamera = prefs[Keys.MIRROR_FRONT] ?: true,
+                backlightMode = prefs[Keys.BACKLIGHT_MODE]?.let { runCatching { BacklightMode.valueOf(it) }.getOrNull() }
+                    ?: BacklightMode.AUTO,
+                backlightDehazeStrength = prefs[Keys.BACKLIGHT_DEHAZE] ?: 0.65f,
+                backlightShadowClarity = prefs[Keys.BACKLIGHT_CLARITY] ?: 0.55f,
             )
         )
     }

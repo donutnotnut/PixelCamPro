@@ -350,6 +350,19 @@ fun PhotoInspectorScreen(
                                     )
                                 }
                             }
+                            if (activeRecord.isBacklightEnhanced) {
+                                Surface(
+                                    shape = CircleShape,
+                                    color = PixelAmber.copy(alpha = 0.22f),
+                                ) {
+                                    Text(
+                                        text = "Backlight",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = PixelAmber,
+                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                                    )
+                                }
+                            }
                             if (activeRecord.isUltraHdr) {
                                 Surface(
                                     shape = CircleShape,

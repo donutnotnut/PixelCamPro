@@ -23,6 +23,12 @@ enum class NightSightMode(val label: String, val shortLabel: String) {
     OFF("Off", "Off")
 }
 
+enum class BacklightMode(val label: String, val badge: String) {
+    AUTO("Auto", "Backlight Auto"),
+    ON("On", "Backlight On"),
+    OFF("Off", "Backlight Off"),
+}
+
 enum class PixelExtensionMode(val label: String, val badge: String) {
     NONE("Off", "Off"),
     AUTO("Auto", "Pixel Auto"),
@@ -341,6 +347,9 @@ data class HdrPipelineConfig(
     val sabreSharpening: Float = 0.72f,
     val rawDngEnabled: Boolean = false,
     val mirrorFrontCamera: Boolean = true,
+    val backlightMode: BacklightMode = BacklightMode.AUTO,
+    val backlightDehazeStrength: Float = 0.65f,
+    val backlightShadowClarity: Float = 0.55f,
 )
 
 @Immutable
@@ -397,6 +406,8 @@ data class HdrProcessMetrics(
     val isUltraHdr: Boolean = false,
     val isNightSight: Boolean = false,
     val totalExposureSeconds: Float = 0f,
+    val isBacklightEnhanced: Boolean = false,
+    val backlightDehazeApplied: Float = 0f,
 )
 
 @Immutable
@@ -417,6 +428,7 @@ data class CapturedPhotoRecord(
     val hasDngRaw: Boolean = false,
     val isUltraHdr: Boolean = false,
     val isNightSight: Boolean = false,
+    val isBacklightEnhanced: Boolean = false,
     val lumaHistogram: List<Int> = emptyList(),
 )
 

@@ -63,6 +63,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.camera.model.AspectRatioMode
+import com.example.camera.model.BacklightMode
 import com.example.camera.model.GridOverlayType
 import com.example.camera.model.HdrMode
 import com.example.camera.model.HdrPipelineConfig
@@ -108,6 +109,7 @@ fun PixelSettingsSheet(
     var showAspectDialog by remember { mutableStateOf(false) }
     var showHdrModeDialog by remember { mutableStateOf(false) }
     var showNightSightDialog by remember { mutableStateOf(false) }
+    var showBacklightDialog by remember { mutableStateOf(false) }
     var showBurstDialog by remember { mutableStateOf(false) }
     var advancedExpanded by remember { mutableStateOf(false) }
     val effectiveAdvancedExpanded = advancedExpanded && !isPixelServicesLocked
@@ -317,6 +319,28 @@ fun PixelSettingsSheet(
                     },
                 )
             }
+            item(key = "row_backlight", contentType = "picker") {
+                val backlightEnabled = !isNightSightActive && !isPixelServicesLocked
+                PixelPickerRow(
+                    icon = Icons.Rounded.WbSunny,
+                    title = "Backlight picture",
+                    valueLabel = when {
+                        isPixelServicesLocked -> "Managed by Pixel Camera Services"
+                        isNightSightActive -> "Disabled in Low Light"
+                        else -> when (hdrConfig.backlightMode) {
+                            BacklightMode.AUTO -> "Auto (detects backlight)"
+                            BacklightMode.ON -> "Always On (anti-glare active)"
+                            BacklightMode.OFF -> "Off"
+                        }
+                    },
+                    position = ExpressiveListPosition.MIDDLE,
+                    badgeShape = ExpressiveButtonShape.CIRCLE_TO_CLOVER,
+                    accentContainer = MaterialTheme.colorScheme.secondaryContainer,
+                    accentContent = MaterialTheme.colorScheme.onSecondaryContainer,
+                    enabled = backlightEnabled,
+                    onClick = { showBacklightDialog = true },
+                )
+            }
             item(key = "row_burst", contentType = "picker") {
                 val burstEnabled = !isNightSightActive && !isPixelServicesLocked
                 PixelPickerRow(
@@ -472,6 +496,20 @@ fun PixelSettingsSheet(
                                     onUpdatePrefs { it.copy(hdrConfig = it.hdrConfig.copy(sabreSharpening = v)) }
                                 },
                             )
+                            PixelSettingsSlider(
+                                title = "Backlight anti-flare dehaze",
+                                value = hdrConfig.backlightDehazeStrength,
+                                onValueChange = { v ->
+                                    onUpdatePrefs { it.copy(hdrConfig = it.hdrConfig.copy(backlightDehazeStrength = v)) }
+                                },
+                            )
+                            PixelSettingsSlider(
+                                title = "Backlight shadow clarity",
+                                value = hdrConfig.backlightShadowClarity,
+                                onValueChange = { v ->
+                                    onUpdatePrefs { it.copy(hdrConfig = it.hdrConfig.copy(backlightShadowClarity = v)) }
+                                },
+                            )
                         }
                     }
                 }
@@ -605,6 +643,23 @@ fun PixelSettingsSheet(
                 showBurstDialog = false
             },
             onDismiss = { showBurstDialog = false },
+        )
+    }
+
+    if (showBacklightDialog) {
+        PixelOptionDialog(
+            title = "Backlight picture",
+            options = listOf(
+                BacklightMode.AUTO to "Auto (Recommended — anti-glare when backlit)",
+                BacklightMode.ON to "Always On (Force anti-glare & subject clarity)",
+                BacklightMode.OFF to "Off (Standard HDR+)",
+            ),
+            selected = hdrConfig.backlightMode,
+            onSelect = { mode ->
+                onUpdatePrefs { it.copy(hdrConfig = it.hdrConfig.copy(backlightMode = mode)) }
+                showBacklightDialog = false
+            },
+            onDismiss = { showBacklightDialog = false },
         )
     }
 }

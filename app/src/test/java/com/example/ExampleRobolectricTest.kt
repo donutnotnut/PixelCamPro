@@ -4,6 +4,8 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
 import androidx.test.core.app.ApplicationProvider
+import com.example.camera.model.AspectRatioMode
+import com.example.camera.model.BacklightMode
 import com.example.camera.model.CameraMode
 import com.example.camera.model.HdrMode
 import com.example.camera.model.HdrPipelineConfig
@@ -1178,5 +1180,74 @@ class ExampleRobolectricTest {
         assertTrue(vm.uiState.value.isProPanelExpanded)
         vm.updateIso(400)
         assertEquals(400, vm.uiState.value.manualSettings.iso)
+    }
+
+    @Test
+    fun `backlight picture mode state and anti-soaping processing`() = runTest {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val vm = com.example.ui.viewmodel.CameraViewModel(app)
+
+        // 1. Verify default BacklightMode is AUTO
+        assertEquals(BacklightMode.AUTO, vm.uiState.value.hdrConfig.backlightMode)
+        assertFalse(vm.uiState.value.isBacklightActive)
+
+        // 2. When backlit scene is detected in AUTO mode, isBacklightActive becomes true
+        vm.updateLowLightDetection(
+            meanLuma = 0.45f,
+            crushedShadowPercent = 18f,
+            clippedHighlightPercent = 8.5f,
+        )
+        assertTrue(vm.uiState.value.isBacklitDetected)
+        assertTrue(vm.uiState.value.isBacklightActive)
+
+        // 3. Toggling quick mode: AUTO -> ON -> OFF -> AUTO
+        vm.toggleBacklightModeQuick()
+        assertEquals(BacklightMode.ON, vm.uiState.value.hdrConfig.backlightMode)
+        assertTrue(vm.uiState.value.isBacklightActive)
+
+        vm.toggleBacklightModeQuick()
+        assertEquals(BacklightMode.OFF, vm.uiState.value.hdrConfig.backlightMode)
+        assertFalse(vm.uiState.value.isBacklightActive)
+
+        vm.toggleBacklightModeQuick()
+        assertEquals(BacklightMode.AUTO, vm.uiState.value.hdrConfig.backlightMode)
+
+        // 4. Verify HdrPlusEngine processes backlit scene with anti-glare dehazing & micro-contrast
+        val engine = HdrPlusEngine()
+        val w = 64
+        val h = 64
+        val backlitFrame = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
+            for (y in 0 until h) {
+                for (x in 0 until w) {
+                    // Backlit test pattern: dark subject in center (shadows with fine texture), bright background
+                    val isCenterSubject = x in 16..48 && y in 16..48
+                    val baseLuma = if (isCenterSubject) 35 else 245
+                    // Fine micro-texture in subject
+                    val texture = if (isCenterSubject && (x + y) % 2 == 0) 6 else 0
+                    val v = (baseLuma + texture).coerceIn(0, 255)
+                    setPixel(x, y, Color.rgb(v, v, v))
+                }
+            }
+        }
+
+        val result = engine.processBurst(
+            frames = listOf(backlitFrame),
+            mode = CameraMode.CAMERA,
+            hdrMode = HdrMode.HDR_PLUS_ENHANCED,
+            manual = ManualExposureSettings(),
+            config = HdrPipelineConfig(
+                backlightMode = BacklightMode.ON,
+                backlightDehazeStrength = 0.75f,
+                backlightShadowClarity = 0.65f,
+            ),
+            isBacklightActive = true,
+        )
+
+        assertTrue(result.metrics.isBacklightEnhanced)
+        assertTrue(result.metrics.backlightDehazeApplied > 0.01f)
+        assertTrue(result.bitmap.width == w && result.bitmap.height == h)
+
+        backlitFrame.recycle()
+        result.bitmap.recycle()
     }
 }

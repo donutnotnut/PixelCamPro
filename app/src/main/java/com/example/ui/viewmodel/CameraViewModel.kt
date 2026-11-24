@@ -14,6 +14,7 @@ import com.example.camera.hardware.HorizonOrientation
 import com.example.camera.hardware.HorizonSensorMonitor
 import com.example.camera.hardware.RawCapturedFrame
 import com.example.camera.model.AspectRatioMode
+import com.example.camera.model.BacklightMode
 import com.example.camera.model.CameraMode
 import com.example.camera.model.CapturedPhotoRecord
 import com.example.camera.model.FlashMode
@@ -210,6 +211,16 @@ data class CameraUiState(
             }
         }
 
+    /** True when Backlight Picture optimization should be actively applied to captures and preview. */
+    val isBacklightActive: Boolean
+        get() = !isNightSightActive &&
+            !isPixelServicesLocked &&
+            when (hdrConfig.backlightMode) {
+                BacklightMode.ON -> true
+                BacklightMode.AUTO -> isBacklitDetected
+                BacklightMode.OFF -> false
+            }
+
     /** Automatically disables all HDR modes while Low Light / Night Sight is active. */
     val effectiveHdrMode: HdrMode
         get() = if (isNightSightActive) HdrMode.OFF else hdrMode
@@ -281,6 +292,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val totalExposureSeconds: Float = 0f,
         val isPixelExtensionCapture: Boolean = false,
         val pixelExtensionMode: PixelExtensionMode = PixelExtensionMode.NONE,
+        val isBacklightActive: Boolean = false,
     )
 
     private val renderQueue = Channel<PendingRenderJob>(capacity = MAX_PENDING_RENDERS)
@@ -450,6 +462,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 lowLightSeverity = job.lowLightSeverity,
                 totalExposureSeconds = job.totalExposureSeconds,
                 isPixelExtensionCapture = job.isPixelExtensionCapture,
+                isBacklightActive = job.isBacklightActive,
             )
             processedBitmap = processed.bitmap
 
@@ -495,6 +508,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     val holdTag = LowLightDetector.formatExposureSeconds(job.totalExposureSeconds.coerceAtLeast(0.5f))
                     showBanner(
                         "Night Sight • ${processed.metrics.framesMerged}f • $holdTag • ${processed.metrics.processingTimeMs}ms"
+                    )
+                } else if (processed.metrics.isBacklightEnhanced) {
+                    val hdrTag = if (record.isUltraHdr) "UHDR" else job.hdrMode.badge
+                    showBanner(
+                        "$hdrTag • Backlight Photo • ${processed.metrics.framesMerged}f • ${processed.metrics.processingTimeMs}ms"
                     )
                 } else {
                     val hdrTag = if (record.isUltraHdr) "UHDR" else job.hdrMode.badge
@@ -913,6 +931,26 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
         setNightSightMode(next)
         showBanner(if (next == NightSightMode.OFF) "Night Sight paused" else "Night Sight Auto enabled")
+    }
+
+    fun toggleBacklightModeQuick() {
+        val current = _uiState.value.hdrConfig.backlightMode
+        val next = when (current) {
+            BacklightMode.AUTO -> BacklightMode.ON
+            BacklightMode.ON -> BacklightMode.OFF
+            BacklightMode.OFF -> BacklightMode.AUTO
+        }
+        setBacklightMode(next)
+        val msg = when (next) {
+            BacklightMode.AUTO -> "Backlight Photo: Auto (active when backlit)"
+            BacklightMode.ON -> "Backlight Photo: Always On (anti-glare active)"
+            BacklightMode.OFF -> "Backlight Photo: Off"
+        }
+        showBanner(msg)
+    }
+
+    fun setBacklightMode(mode: BacklightMode) {
+        persistPrefs { it.copy(hdrConfig = it.hdrConfig.copy(backlightMode = mode)) }
     }
 
     private fun syncLowLightBoost() {
@@ -1605,7 +1643,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         requestedFrameCount = targetFrames,
                         manualSettings = snapshot.manualSettings,
                         mirrorFrontCamera = effectiveHdrConfig.mirrorFrontCamera,
-                        isBacklit = snapshot.isBacklitDetected,
+                        isBacklit = snapshot.isBacklightActive,
                         previewView = activePreviewViewRef?.get(),
                         isAeAfLocked = snapshot.focusReticle?.isAeAfLocked == true,
                         onFrameCaptured = { count, total ->
@@ -1653,6 +1691,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     totalExposureSeconds = totalExposureSeconds,
                     isPixelExtensionCapture = usePixelExtensions,
                     pixelExtensionMode = activeExtMode,
+                    isBacklightActive = snapshot.isBacklightActive,
                 )
 
                 val sendResult = renderQueue.trySend(job)
