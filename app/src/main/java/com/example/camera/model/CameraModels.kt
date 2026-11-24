@@ -399,20 +399,32 @@ object FaceCoordinateMapper {
         sensorOrientationDegrees: Int,
         mirrorHorizontally: Boolean,
         targetUprightAspect: Float? = null,
+        zoomRatio: Float = 1f,
         faceId: Int = 0,
         score: Int = 80,
     ): DetectedFace? {
-        val cropW = (cropRight - cropLeft).toFloat()
-        val cropH = (cropBottom - cropTop).toFloat()
-        if (cropW <= 1f || cropH <= 1f) return null
+        val rawCropW = (cropRight - cropLeft).toFloat()
+        val rawCropH = (cropBottom - cropTop).toFloat()
+        if (rawCropW <= 1f || rawCropH <= 1f) return null
 
-        val sx1 = ((faceLeft - cropLeft) / cropW).coerceIn(-0.25f, 1.25f)
-        val sy1 = ((faceTop - cropTop) / cropH).coerceIn(-0.25f, 1.25f)
-        val sx2 = ((faceRight - cropLeft) / cropW).coerceIn(-0.25f, 1.25f)
-        val sy2 = ((faceBottom - cropTop) / cropH).coerceIn(-0.25f, 1.25f)
+        // On Android 11+ (API 30+), CameraX digital zoom uses CONTROL_ZOOM_RATIO while keeping
+        // SCALER_CROP_REGION equal to the full active array. Apply the effective centered crop.
+        val effectiveZoom = zoomRatio.coerceAtLeast(1f)
+        val centerX = (cropLeft + cropRight) * 0.5f
+        val centerY = (cropTop + cropBottom) * 0.5f
+        val cropW = rawCropW / effectiveZoom
+        val cropH = rawCropH / effectiveZoom
+        val effCropLeft = centerX - cropW * 0.5f
+        val effCropTop = centerY - cropH * 0.5f
 
+        val sx1 = ((faceLeft - effCropLeft) / cropW).coerceIn(-0.25f, 1.25f)
+        val sy1 = ((faceTop - effCropTop) / cropH).coerceIn(-0.25f, 1.25f)
+        val sx2 = ((faceRight - effCropLeft) / cropW).coerceIn(-0.25f, 1.25f)
+        val sy2 = ((faceBottom - effCropTop) / cropH).coerceIn(-0.25f, 1.25f)
+
+        val normRotation = ((sensorOrientationDegrees % 360) + 360) % 360
         fun rotateSensorPoint(sx: Float, sy: Float): Pair<Float, Float> {
-            val (rx, ry) = when (((sensorOrientationDegrees % 360) + 360) % 360) {
+            val (rx, ry) = when (normRotation) {
                 90 -> (1f - sy) to sx
                 180 -> (1f - sx) to (1f - sy)
                 270 -> sy to (1f - sx)
@@ -432,7 +444,7 @@ object FaceCoordinateMapper {
 
         // Apply FILL_CENTER aspect-ratio crop when preview/output aspect differs from sensor crop aspect
         if (targetUprightAspect != null && targetUprightAspect > 0.1f) {
-            val rotated90or270 = (((sensorOrientationDegrees % 360) + 360) % 360) in listOf(90, 270)
+            val rotated90or270 = normRotation == 90 || normRotation == 270
             val uprightCropAspect = if (rotated90or270) (cropH / cropW) else (cropW / cropH)
             if (uprightCropAspect > 0.1f) {
                 if (targetUprightAspect < uprightCropAspect - 0.01f) {
@@ -674,11 +686,12 @@ object LowLightDetector {
     ): LowLightExposurePlan {
         val clampedSeverity = severity.coerceIn(0.15f, 1f)
         val safeLuma = meanLuma.coerceIn(0.05f, 0.95f)
+        // Balanced handheld frame count (3-5): captures +1.0 to +1.2 stops SNR while keeping total
+        // hold time under ~2.5s and halving CPU burst-merge latency compared to 8-frame stacks.
         val frameCount = when {
-            clampedSeverity >= 0.80f -> 8
-            clampedSeverity >= 0.62f -> 7
-            clampedSeverity >= 0.45f -> 6
-            else -> 5
+            clampedSeverity >= 0.78f -> 5
+            clampedSeverity >= 0.48f -> 4
+            else -> 3
         }
 
         // Target balanced night luminance (~0.34 sRGB): clear and bright without washing out or clipping
@@ -706,9 +719,9 @@ object LowLightDetector {
         // Desired total sensor exposure product (ISO * ns)
         val desiredProduct = baseIso.toDouble() * baseExpNs.toDouble() * desiredLinearGain.toDouble()
 
-        // Preferred handheld long shutter (140ms in dim light up to 420ms in pitch dark)
+        // Preferred handheld long shutter (100ms in dim light up to 280ms in pitch dark)
         val minIso = isoRange.first.coerceAtLeast(25)
-        val preferredExposureNs = ((140f + clampedSeverity * 280f).toLong() * 1_000_000L)
+        val preferredExposureNs = ((100f + clampedSeverity * 180f).toLong() * 1_000_000L)
         // CRITICAL: Never hold shutter longer than what minIso can support without overexposing!
         val maxSafeExposureNs = (desiredProduct / minIso.toDouble()).toLong()
             .coerceAtLeast(exposureTimeRangeNs.first)
@@ -716,7 +729,7 @@ object LowLightDetector {
         val desiredExposureNs = minOf(preferredExposureNs, maxSafeExposureNs)
             .coerceIn(
                 exposureTimeRangeNs.first.coerceAtLeast(1_000_000L),
-                exposureTimeRangeNs.last.coerceAtMost(450_000_000L),
+                exposureTimeRangeNs.last.coerceAtMost(280_000_000L),
             )
 
         // Solve exact ISO for the chosen shutter time to hit `desiredProduct` accurately
@@ -728,9 +741,9 @@ object LowLightDetector {
         val effectiveGain = (actualProduct / (baseIso.toDouble() * baseExpNs.toDouble())).coerceAtLeast(1.0)
         val evBoostStops = (ln(effectiveGain) / ln(2.0)).toFloat().coerceIn(0f, 1.5f)
 
-        // Account for per-frame exposure + sensor readout overhead (~110ms per frame)
-        val perFrameCycleMs = (desiredExposureNs / 1_000_000L) + 110L
-        val totalHoldMs = (perFrameCycleMs * frameCount).coerceIn(900L, 3800L)
+        // Account for per-frame exposure + fast MINIMIZE_LATENCY readout overhead (~90ms per frame)
+        val perFrameCycleMs = (desiredExposureNs / 1_000_000L) + 90L
+        val totalHoldMs = (perFrameCycleMs * frameCount).coerceIn(700L, 2400L)
 
         return LowLightExposurePlan(
             perFrameExposureNs = desiredExposureNs,

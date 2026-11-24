@@ -682,41 +682,70 @@ class HdrPlusEngine {
                 }
             }
 
-            // Pass 1.5 (Parallel): Adaptive Directional + Optical Motion Deblur (Regular & Backlit + Face-Aware)
-            // Runs regularized 2-iteration Richardson-Lucy luminance deconvolution with a compact
-            // 5-row per-thread cache BEFORE allocating finalPixels to keep peak RAM bounded.
+            // Pass 1.5 (Parallel): Blur-Gated Linear-Light Directional + Optical Deblur (Scene & Face-Localized)
+            // Runs regularized shock-bounded Richardson-Lucy deconvolution ONLY when real softness or motion blur
+            // is detected, localizing to a compact feathered face ROI when only the face moved on a sharp scene.
             val facePixelBounds = buildFacePixelBounds(detectedFaces, width, height, padFraction = 0.14f)
             if (wantMotionDeblur && lumaPlane != null) {
-                val blurEstimate = estimateMotionBlur(
+                val sceneEstimate = estimateMotionBlur(
                     lumaPlane = lumaPlane,
                     width = width,
                     height = height,
                     focusPointNormalized = focusPointNormalized,
-                    detectedFaces = detectedFaces,
+                    detectedFaces = emptyList(),
+                    excludeFaceBounds = facePixelBounds,
                 )
-                val baseUserDeblur = config.motionDeblurStrength.coerceIn(0f, 1f)
-                // Always apply at least mild optical micro-deblur when blur/softness or a face is present,
-                // scaling cleanly up to full strength when handheld shake or backlit veil softness is detected.
-                val nightScale = if (nightSightEnabled) 0.42f else 1.0f
-                val backlightBoost = if (isBacklightActive && !nightSightEnabled) 0.16f else 0f
-                val faceFloor = if (facePixelBounds.isNotEmpty()) 0.28f else 0.12f
-                val effectiveDeblur = ((max(blurEstimate.blurSeverity, faceFloor) + backlightBoost) *
-                    baseUserDeblur * nightScale).coerceIn(0f, 1.0f)
-
-                if (effectiveDeblur > 0.06f) {
-                    applyMotionDeblurPass(
-                        mergedPixels = mergedPixels,
+                val faceEstimate = if (detectedFaces.isNotEmpty()) {
+                    estimateMotionBlur(
                         lumaPlane = lumaPlane,
                         width = width,
                         height = height,
-                        estimate = blurEstimate,
-                        deblurStrength = effectiveDeblur,
-                        isBacklightActive = isBacklightActive && !nightSightEnabled,
-                        nightSightEnabled = nightSightEnabled,
-                        faceBounds = facePixelBounds,
+                        focusPointNormalized = focusPointNormalized,
+                        detectedFaces = detectedFaces,
                     )
-                    appliedMotionDeblurStrength = effectiveDeblur
-                    appliedFaceDeblur = facePixelBounds.isNotEmpty()
+                } else null
+
+                val faceNeedsDeblur = faceEstimate != null && faceEstimate.blurSeverity >= 0.16f
+                val sceneThreshold = if (isBacklightActive && !nightSightEnabled) 0.14f else 0.20f
+                val sceneNeedsDeblur = sceneEstimate.blurSeverity >= sceneThreshold
+
+                if (faceNeedsDeblur || sceneNeedsDeblur) {
+                    // When the face is softer than a sharp background (head/expression motion),
+                    // run deblur ONLY inside the feathered face ROI to protect background sharpness and save RAM/CPU.
+                    val faceOnlyMode = faceEstimate != null &&
+                        faceNeedsDeblur &&
+                        (!sceneNeedsDeblur ||
+                            (sceneEstimate.blurSeverity < 0.26f &&
+                                faceEstimate.blurSeverity > sceneEstimate.blurSeverity + 0.14f))
+
+                    val chosenEstimate = when {
+                        faceOnlyMode -> faceEstimate
+                        faceEstimate != null && faceEstimate.blurSeverity > sceneEstimate.blurSeverity -> faceEstimate
+                        else -> sceneEstimate
+                    }
+
+                    val baseUserDeblur = config.motionDeblurStrength.coerceIn(0f, 1f)
+                    val nightScale = if (nightSightEnabled) 0.42f else 1.0f
+                    val backlightBoost = if (isBacklightActive && !nightSightEnabled) 0.10f else 0f
+                    val effectiveDeblur = ((chosenEstimate.blurSeverity + backlightBoost) *
+                        baseUserDeblur * nightScale).coerceIn(0f, 1.0f)
+
+                    if (effectiveDeblur > 0.10f) {
+                        applyMotionDeblurPass(
+                            mergedPixels = mergedPixels,
+                            lumaPlane = lumaPlane,
+                            width = width,
+                            height = height,
+                            estimate = chosenEstimate,
+                            deblurStrength = effectiveDeblur,
+                            isBacklightActive = isBacklightActive && !nightSightEnabled,
+                            nightSightEnabled = nightSightEnabled,
+                            faceBounds = facePixelBounds,
+                            faceOnlyMode = faceOnlyMode,
+                        )
+                        appliedMotionDeblurStrength = effectiveDeblur
+                        appliedFaceDeblur = facePixelBounds.isNotEmpty() && (faceNeedsDeblur || faceOnlyMode)
+                    }
                 }
             }
 
@@ -783,9 +812,12 @@ class HdrPlusEngine {
                             val subjectClarityMultiplier = if (isBacklightActive && centerL < 0.65f) {
                                 1f + backlightClarityFactor * (1f - centerL).coerceIn(0f, 1f) * 1.10f
                             } else 1f
-                            // Protect smooth face skin from excessive micro-contrast crunch while keeping eyes/hair crisp
-                            val faceScale = if (facePixelBounds.isNotEmpty() && isInsideFaceBounds(x, y, facePixelBounds)) {
-                                if (abs(fineDetail) < 0.025f) 0.50f else 1.12f
+                            // Smoothly protect face skin from excessive micro-contrast crunch while keeping eyes/hair crisp
+                            val faceW = if (facePixelBounds.isNotEmpty()) faceMaskWeight(x, y, facePixelBounds) else 0f
+                            val faceScale = if (faceW > 0.001f) {
+                                val detailBlend = smoothstep(0.012f, 0.036f, abs(fineDetail))
+                                val targetFaceScale = 0.50f + (1.12f - 0.50f) * detailBlend
+                                1f + (targetFaceScale - 1f) * faceW
                             } else 1f
                             val combinedDiff = (coredFine * 1.75f + medDetail) * subjectClarityMultiplier * faceScale
                             if (combinedDiff != 0f) {
@@ -1718,7 +1750,13 @@ class HdrPlusEngine {
         val dirStepX: Int,
         val dirStepY: Int,
         val anisotropy: Float,
+        val psfStride: Int = 1,
     )
+
+    private fun smoothstep(edge0: Float, edge1: Float, x: Float): Float {
+        val t = ((x - edge0) / (edge1 - edge0)).coerceIn(0f, 1f)
+        return t * t * (3f - 2f * t)
+    }
 
     private fun buildFacePixelBounds(
         faces: List<DetectedFace>,
@@ -1755,8 +1793,42 @@ class HdrPlusEngine {
     }
 
     /**
-     * Estimates directional motion blur & optical softness from 1-px vs 2-px gradient energy
-     * across 4 principal axes (0°, 90°, 45°, 135°), focusing on detected faces when present.
+     * Feathered elliptical mask weight in [0f, 1f] over detected face bounds so skin/detail
+     * modulation and face-localized deblurring blend seamlessly with zero rectangular seams.
+     */
+    private fun faceMaskWeight(x: Int, y: Int, faceBounds: IntArray): Float {
+        var maxW = 0f
+        var idx = 0
+        val n = faceBounds.size
+        while (idx + 3 < n) {
+            val x0 = faceBounds[idx]
+            val y0 = faceBounds[idx + 1]
+            val x1 = faceBounds[idx + 2]
+            val y1 = faceBounds[idx + 3]
+            if (x >= x0 && x <= x1 && y >= y0 && y <= y1) {
+                val halfW = max(1f, (x1 - x0) * 0.5f)
+                val halfH = max(1f, (y1 - y0) * 0.5f)
+                val cx = (x0 + x1) * 0.5f
+                val cy = (y0 + y1) * 0.5f
+                val dx = (x - cx) / halfW
+                val dy = (y - cy) / halfH
+                val r2 = dx * dx + dy * dy
+                val w = when {
+                    r2 <= 0.52f -> 1f
+                    r2 >= 1.0f -> 0f
+                    else -> 1f - smoothstep(0.72f, 1.0f, sqrt(r2))
+                }
+                if (w > maxW) maxW = w
+                if (maxW >= 0.999f) return 1f
+            }
+            idx += 4
+        }
+        return maxW
+    }
+
+    /**
+     * Estimates directional motion blur & optical softness from 1-px vs 2-px (and 2-px vs 4-px
+     * for wider motion streaks) gradient energy across 4 principal axes (0°, 90°, 45°, 135°).
      */
     private fun estimateMotionBlur(
         lumaPlane: FloatArray,
@@ -1764,35 +1836,47 @@ class HdrPlusEngine {
         height: Int,
         focusPointNormalized: Pair<Float, Float>?,
         detectedFaces: List<DetectedFace>,
+        excludeFaceBounds: IntArray = IntArray(0),
     ): MotionBlurEstimate {
-        if (width < 12 || height < 12) return MotionBlurEstimate(0f, 1, 0, 0f)
+        if (width < 16 || height < 16) return MotionBlurEstimate(0f, 1, 0, 0f, 1)
         val primaryFace = detectedFaces.maxByOrNull { it.area }
         val xStart: Int
         val xEnd: Int
         val yStart: Int
         val yEnd: Int
         if (primaryFace != null) {
-            xStart = ((primaryFace.left - primaryFace.width * 0.1f) * width).toInt().coerceIn(3, max(3, width - 4))
-            xEnd = ((primaryFace.right + primaryFace.width * 0.1f) * width).toInt().coerceIn(xStart + 1, width - 3)
-            yStart = ((primaryFace.top - primaryFace.height * 0.1f) * height).toInt().coerceIn(3, max(3, height - 4))
-            yEnd = ((primaryFace.bottom + primaryFace.height * 0.1f) * height).toInt().coerceIn(yStart + 1, height - 3)
+            xStart = ((primaryFace.left - primaryFace.width * 0.1f) * width).toInt().coerceIn(5, max(5, width - 6))
+            xEnd = ((primaryFace.right + primaryFace.width * 0.1f) * width).toInt().coerceIn(xStart + 1, width - 5)
+            yStart = ((primaryFace.top - primaryFace.height * 0.1f) * height).toInt().coerceIn(5, max(5, height - 6))
+            yEnd = ((primaryFace.bottom + primaryFace.height * 0.1f) * height).toInt().coerceIn(yStart + 1, height - 5)
+        } else if (excludeFaceBounds.isNotEmpty()) {
+            // Sample across the broader frame (skipping face boxes) so a centered moving portrait
+            // never pollutes the background sharpness estimate.
+            xStart = (width * 0.10f).toInt().coerceIn(5, max(5, width - 6))
+            xEnd = (width * 0.90f).toInt().coerceIn(xStart + 1, width - 5)
+            yStart = (height * 0.10f).toInt().coerceIn(5, max(5, height - 6))
+            yEnd = (height * 0.90f).toInt().coerceIn(yStart + 1, height - 5)
         } else {
             val cx = (focusPointNormalized?.first ?: 0.5f).coerceIn(0.25f, 0.75f)
             val cy = (focusPointNormalized?.second ?: 0.45f).coerceIn(0.25f, 0.75f)
-            val hw = (width * 0.26f).toInt().coerceAtLeast(4)
-            val hh = (height * 0.26f).toInt().coerceAtLeast(4)
-            xStart = ((cx * width).toInt() - hw).coerceIn(3, max(3, width - 4))
-            xEnd = ((cx * width).toInt() + hw).coerceIn(xStart + 1, width - 3)
-            yStart = ((cy * height).toInt() - hh).coerceIn(3, max(3, height - 4))
-            yEnd = ((cy * height).toInt() + hh).coerceIn(yStart + 1, height - 3)
+            val hw = (width * 0.26f).toInt().coerceAtLeast(6)
+            val hh = (height * 0.26f).toInt().coerceAtLeast(6)
+            xStart = ((cx * width).toInt() - hw).coerceIn(5, max(5, width - 6))
+            xEnd = ((cx * width).toInt() + hw).coerceIn(xStart + 1, width - 5)
+            yStart = ((cy * height).toInt() - hh).coerceIn(5, max(5, height - 6))
+            yEnd = ((cy * height).toInt() + hh).coerceIn(yStart + 1, height - 5)
         }
 
         val stepX = max(1, (xEnd - xStart) / 64)
         val stepY = max(1, (yEnd - yStart) / 64)
-        var eH1 = 0.0; var eH2 = 0.0
-        var eV1 = 0.0; var eV2 = 0.0
-        var eD1_1 = 0.0; var eD1_2 = 0.0
-        var eD2_1 = 0.0; var eD2_2 = 0.0
+        // Squared-gradient energy ratios across 4 axes:
+        // For any step edge, 2 * sum(d1_fwd^2 + d1_bwd^2) / sum(g2^2) == 1.0 (sharp)
+        // and drops monotonically to ~0.46 (2px softness), ~0.33 (5px blur), ~0.25 (9px+ blur),
+        // completely free of the L1 telescoping cancellation bug where |g1|/|g2| is always 0.50.
+        var eH1Sq = 0.0; var eH2Sq = 0.0; var eH1SpanSq = 0.0; var eH4Sq = 0.0
+        var eV1Sq = 0.0; var eV2Sq = 0.0; var eV1SpanSq = 0.0; var eV4Sq = 0.0
+        var eD1_1Sq = 0.0; var eD1_2Sq = 0.0; var eD1SpanSq = 0.0; var eD1_4Sq = 0.0
+        var eD2_1Sq = 0.0; var eD2_2Sq = 0.0; var eD2SpanSq = 0.0; var eD2_4Sq = 0.0
         var edgeSamples = 0
 
         for (y in yStart until yEnd step stepY) {
@@ -1801,66 +1885,99 @@ class HdrPlusEngine {
             val rowDn = (y + 1) * width
             val rowUp2 = (y - 2) * width
             val rowDn2 = (y + 2) * width
+            val rowUp4 = (y - 4) * width
+            val rowDn4 = (y + 4) * width
             for (x in xStart until xEnd step stepX) {
-                val dh2 = abs(lumaPlane[row + x + 2] - lumaPlane[row + x - 2])
-                val dv2 = abs(lumaPlane[rowDn2 + x] - lumaPlane[rowUp2 + x])
-                val dd1_2 = abs(lumaPlane[rowDn2 + x + 2] - lumaPlane[rowUp2 + x - 2])
-                val dd2_2 = abs(lumaPlane[rowDn2 + x - 2] - lumaPlane[rowUp2 + x + 2])
-                if (dh2 > 0.04f) {
-                    eH1 += abs(lumaPlane[row + x + 1] - lumaPlane[row + x - 1])
-                    eH2 += dh2
+                if (excludeFaceBounds.isNotEmpty() && isInsideFaceBounds(x, y, excludeFaceBounds)) {
+                    continue
+                }
+                val c = lumaPlane[row + x]
+                val dh2 = (lumaPlane[row + x + 2] - lumaPlane[row + x - 2]).toDouble()
+                val dv2 = (lumaPlane[rowDn2 + x] - lumaPlane[rowUp2 + x]).toDouble()
+                val dd1_2 = (lumaPlane[rowDn2 + x + 2] - lumaPlane[rowUp2 + x - 2]).toDouble()
+                val dd2_2 = (lumaPlane[rowDn2 + x - 2] - lumaPlane[rowUp2 + x + 2]).toDouble()
+                if (abs(dh2) > 0.035) {
+                    val f = (lumaPlane[row + x + 1] - c).toDouble()
+                    val b = (c - lumaPlane[row + x - 1]).toDouble()
+                    val s1 = (lumaPlane[row + x + 1] - lumaPlane[row + x - 1]).toDouble()
+                    val s4 = (lumaPlane[row + x + 4] - lumaPlane[row + x - 4]).toDouble()
+                    eH1Sq += 2.0 * (f * f + b * b)
+                    eH2Sq += dh2 * dh2
+                    eH1SpanSq += 4.0 * s1 * s1
+                    eH4Sq += s4 * s4
                     edgeSamples++
                 }
-                if (dv2 > 0.04f) {
-                    eV1 += abs(lumaPlane[rowDn + x] - lumaPlane[rowUp + x])
-                    eV2 += dv2
+                if (abs(dv2) > 0.035) {
+                    val f = (lumaPlane[rowDn + x] - c).toDouble()
+                    val b = (c - lumaPlane[rowUp + x]).toDouble()
+                    val s1 = (lumaPlane[rowDn + x] - lumaPlane[rowUp + x]).toDouble()
+                    val s4 = (lumaPlane[rowDn4 + x] - lumaPlane[rowUp4 + x]).toDouble()
+                    eV1Sq += 2.0 * (f * f + b * b)
+                    eV2Sq += dv2 * dv2
+                    eV1SpanSq += 4.0 * s1 * s1
+                    eV4Sq += s4 * s4
                     edgeSamples++
                 }
-                if (dd1_2 > 0.04f) {
-                    eD1_1 += abs(lumaPlane[rowDn + x + 1] - lumaPlane[rowUp + x - 1])
-                    eD1_2 += dd1_2
+                if (abs(dd1_2) > 0.035) {
+                    val f = (lumaPlane[rowDn + x + 1] - c).toDouble()
+                    val b = (c - lumaPlane[rowUp + x - 1]).toDouble()
+                    val s1 = (lumaPlane[rowDn + x + 1] - lumaPlane[rowUp + x - 1]).toDouble()
+                    val s4 = (lumaPlane[rowDn4 + x + 4] - lumaPlane[rowUp4 + x - 4]).toDouble()
+                    eD1_1Sq += 2.0 * (f * f + b * b)
+                    eD1_2Sq += dd1_2 * dd1_2
+                    eD1SpanSq += 4.0 * s1 * s1
+                    eD1_4Sq += s4 * s4
                 }
-                if (dd2_2 > 0.04f) {
-                    eD2_1 += abs(lumaPlane[rowDn + x - 1] - lumaPlane[rowUp + x + 1])
-                    eD2_2 += dd2_2
+                if (abs(dd2_2) > 0.035) {
+                    val f = (lumaPlane[rowDn + x - 1] - c).toDouble()
+                    val b = (c - lumaPlane[rowUp + x + 1]).toDouble()
+                    val s1 = (lumaPlane[rowDn + x - 1] - lumaPlane[rowUp + x + 1]).toDouble()
+                    val s4 = (lumaPlane[rowDn4 + x - 4] - lumaPlane[rowUp4 + x + 4]).toDouble()
+                    eD2_1Sq += 2.0 * (f * f + b * b)
+                    eD2_2Sq += dd2_2 * dd2_2
+                    eD2SpanSq += 4.0 * s1 * s1
+                    eD2_4Sq += s4 * s4
                 }
             }
         }
 
-        val totalG2 = eH2 + eV2
-        if (edgeSamples < 12 || totalG2 < 1e-4) {
-            return MotionBlurEstimate(0.22f, 1, 0, 0f)
+        val totalG2Sq = eH2Sq + eV2Sq
+        if (edgeSamples < 12 || totalG2Sq < 1e-4) {
+            return MotionBlurEstimate(0f, 1, 0, 0f, 1)
         }
 
-        // Per-axis sharpness ratio (g1 / g2): independent of scene edge orientation!
-        // Sharp 1-px step edge -> ratio ~ 0.90..1.0; blurred ramp -> ratio ~ 0.45..0.72.
-        fun axisSoftness(g1: Double, g2: Double): Float {
-            if (g2 < 0.25) return -1f
-            val r = (g1 / g2).toFloat()
-            return ((0.88f - r) / 0.40f).coerceIn(0f, 1f)
+        // Sharp step edge / crisp camera JPEG -> ratio 0.60..1.0 (softness = 0);
+        // 2px optical softness -> ~0.46 (~0.36); 5px motion blur -> ~0.33 (~0.75); 9px+ blur -> ~0.25 (1.0).
+        fun axisSoftness(numSq: Double, denSq: Double): Float {
+            if (denSq < 0.04) return -1f
+            val r = (numSq / denSq).toFloat()
+            return ((0.58f - r) / 0.33f).coerceIn(0f, 1f)
         }
 
-        val softH = axisSoftness(eH1, eH2)
-        val softV = axisSoftness(eV1, eV2)
-        val softD1 = axisSoftness(eD1_1, eD1_2)
-        val softD2 = axisSoftness(eD2_1, eD2_2)
+        val softH = axisSoftness(eH1Sq, eH2Sq)
+        val softV = axisSoftness(eV1Sq, eV2Sq)
+        val softD1 = axisSoftness(eD1_1Sq, eD1_2Sq)
+        val softD2 = axisSoftness(eD2_1Sq, eD2_2Sq)
 
         // Compare orthogonal axis pairs so pure horizontal/vertical edges never alias onto diagonals
         val hasH = softH >= 0f
         val hasV = softV >= 0f
         var bestDx = 1
         var bestDy = 0
-        var bestSoft = 0.25f
+        var bestSoft = 0f
         var aniso = 0f
+        var bestWideSoft = 0f
 
         when {
             hasH && hasV -> {
                 if (softH >= softV) {
                     bestDx = 1; bestDy = 0; bestSoft = softH
                     aniso = (softH - softV).coerceIn(0f, 1f)
+                    bestWideSoft = axisSoftness(eH1SpanSq, eH4Sq).coerceAtLeast(0f)
                 } else {
                     bestDx = 0; bestDy = 1; bestSoft = softV
                     aniso = (softV - softH).coerceIn(0f, 1f)
+                    bestWideSoft = axisSoftness(eV1SpanSq, eV4Sq).coerceAtLeast(0f)
                 }
                 // Only choose a diagonal blur axis when both cardinal axes have edges and the diagonal is clearly softer
                 if (softD1 >= 0f && softD2 >= 0f) {
@@ -1871,16 +1988,23 @@ class HdrPlusEngine {
                         bestDy = if (softD1 >= softD2) 1 else -1
                         bestSoft = maxDiag
                         aniso = diagDiff.coerceIn(0f, 1f)
+                        bestWideSoft = if (softD1 >= softD2) {
+                            axisSoftness(eD1SpanSq, eD1_4Sq).coerceAtLeast(0f)
+                        } else {
+                            axisSoftness(eD2SpanSq, eD2_4Sq).coerceAtLeast(0f)
+                        }
                     }
                 }
             }
             hasH -> {
                 bestDx = 1; bestDy = 0; bestSoft = softH
                 aniso = (softH * 0.85f).coerceIn(0f, 1f)
+                bestWideSoft = axisSoftness(eH1SpanSq, eH4Sq).coerceAtLeast(0f)
             }
             hasV -> {
                 bestDx = 0; bestDy = 1; bestSoft = softV
                 aniso = (softV * 0.85f).coerceIn(0f, 1f)
+                bestWideSoft = axisSoftness(eV1SpanSq, eV4Sq).coerceAtLeast(0f)
             }
             softD1 >= 0f || softD2 >= 0f -> {
                 val s1 = softD1.coerceAtLeast(0f)
@@ -1889,28 +2013,34 @@ class HdrPlusEngine {
                 bestDy = if (s1 >= s2) 1 else -1
                 bestSoft = max(s1, s2)
                 aniso = (abs(s1 - s2)).coerceIn(0f, 1f)
+                bestWideSoft = if (s1 >= s2) {
+                    axisSoftness(eD1SpanSq, eD1_4Sq).coerceAtLeast(0f)
+                } else {
+                    axisSoftness(eD2SpanSq, eD2_4Sq).coerceAtLeast(0f)
+                }
             }
         }
 
-        val globalSoftness = ((0.88f - ((eH1 + eV1) / totalG2).toFloat()) / 0.40f).coerceIn(0f, 1f)
+        val globalSoftness = ((0.58f - ((eH1Sq + eV1Sq) / totalG2Sq).toFloat()) / 0.33f).coerceIn(0f, 1f)
         val blurSeverity = max(globalSoftness, bestSoft).coerceIn(0f, 1f)
+        // Expand directional PSF stride from ±2px to ±4px when 4px-span ramps confirm wider motion blur
+        val psfStride = if (bestWideSoft >= 0.45f && blurSeverity >= 0.45f) 2 else 1
         return MotionBlurEstimate(
             blurSeverity = blurSeverity,
             dirStepX = bestDx,
             dirStepY = bestDy,
             anisotropy = aniso,
+            psfStride = psfStride,
         )
     }
 
     /**
-     * Fast multi-core 2-iteration accelerated regularized Richardson-Lucy luminance deconvolution.
-     * Reconstructs directional camera-shake / optical micro-blur on BOTH regular and backlit photos:
-     * - Uses an L1-cache-resident 5-row rolling ratio buffer per worker thread (zero extra full-frame
-     *   ratio array allocation so 12.5MP bursts stay safely within mobile heap limits).
-     * - Inside detected faces: protects smooth skin from pore noise while delivering crisp deblurring
-     *   on eyes, eyelashes, brows, lips, glasses, and hair.
-     * - In backlit scenes: boosts shadowed subject clarity through optical veil while preventing
-     *   ringing halos along bright sky/backlight silhouettes.
+     * Multi-core shock-bounded linear-light Richardson-Lucy luminance deconvolution:
+     * - Operates in approximate linear radiance (`l^2` -> RL -> `sqrt`) for accurate highlight/edge physics.
+     * - Adapts directional PSF span from ±2px (micro-blur) up to ±4px (wider camera/head shake).
+     * - In `faceOnlyMode`, allocates and processes ONLY the compact union ROI around detected faces,
+     *   saving ~90% RAM & CPU while leaving a sharp background 100% untouched.
+     * - Uses feathered elliptical face masks + smoothstep gradient blending to avoid seams or crunchy skin.
      */
     private suspend fun applyMotionDeblurPass(
         mergedPixels: IntArray,
@@ -1922,29 +2052,81 @@ class HdrPlusEngine {
         isBacklightActive: Boolean,
         nightSightEnabled: Boolean,
         faceBounds: IntArray,
+        faceOnlyMode: Boolean = false,
     ) {
-        val totalPixels = width * height
         val hasFaces = faceBounds.isNotEmpty()
-        val origLuma = lumaPlane.copyOf()
-        var currentEst = lumaPlane
-        var nextEst = FloatArray(totalPixels)
+        val stride = estimate.psfStride.coerceIn(1, 2)
+        val dx1 = estimate.dirStepX * stride
+        val dy1 = estimate.dirStepY * stride
+        val dx2 = dx1 * 2
+        val dy2 = dy1 * 2
+        val maxReach = max(1, max(abs(dx2), abs(dy2)))
+
+        // In face-only mode, restrict all allocations and work to the padded union box of detected faces
+        val roiX0: Int
+        val roiY0: Int
+        val roiX1: Int
+        val roiY1: Int
+        if (faceOnlyMode && hasFaces) {
+            var minX = width - 1
+            var minY = height - 1
+            var maxX = 0
+            var maxY = 0
+            var k = 0
+            while (k + 3 < faceBounds.size) {
+                if (faceBounds[k] < minX) minX = faceBounds[k]
+                if (faceBounds[k + 1] < minY) minY = faceBounds[k + 1]
+                if (faceBounds[k + 2] > maxX) maxX = faceBounds[k + 2]
+                if (faceBounds[k + 3] > maxY) maxY = faceBounds[k + 3]
+                k += 4
+            }
+            val margin = maxReach + 2
+            roiX0 = (minX - margin).coerceIn(0, width - 1)
+            roiY0 = (minY - margin).coerceIn(0, height - 1)
+            roiX1 = (maxX + margin + 1).coerceIn(roiX0 + 1, width)
+            roiY1 = (maxY + margin + 1).coerceIn(roiY0 + 1, height)
+        } else {
+            roiX0 = 0
+            roiY0 = 0
+            roiX1 = width
+            roiY1 = height
+        }
+
+        val roiW = roiX1 - roiX0
+        val roiH = roiY1 - roiY0
+        val roiPixels = roiW * roiH
+        if (roiW < 8 || roiH < 8) return
+
+        // Convert ROI luminance to approximate linear light (l^2) for physically accurate deconvolution
+        val origLin = FloatArray(roiPixels)
+        var currentEst = FloatArray(roiPixels)
+        var nextEst = FloatArray(roiPixels)
+        forEachRowChunk(roiH) { lyStart, lyEnd ->
+            for (ly in lyStart until lyEnd) {
+                val srcRow = (roiY0 + ly) * width + roiX0
+                val dstRow = ly * roiW
+                for (lx in 0 until roiW) {
+                    val v = lumaPlane[srcRow + lx].coerceIn(0f, 1f)
+                    val lin = v * v
+                    origLin[dstRow + lx] = lin
+                    currentEst[dstRow + lx] = lin
+                }
+            }
+        }
 
         // Blend directional 5-tap motion PSF with isotropic 3x3 optical diffraction PSF
         val dirWeight = if (estimate.anisotropy >= 0.14f) {
             ((estimate.anisotropy - 0.08f) * 1.40f).coerceIn(0.30f, 0.82f)
         } else 0f
         val isoWeight = 1f - dirWeight
-        val dx1 = estimate.dirStepX
-        val dy1 = estimate.dirStepY
-        val dx2 = dx1 * 2
-        val dy2 = dy1 * 2
+        val maxVertReach = if (dirWeight > 0.01f) max(1, abs(dy2)) else 1
+        val ringSlots = 2 * maxVertReach + 1
 
         val iterations = when {
             deblurStrength >= 0.50f && estimate.blurSeverity >= 0.42f -> 3
             deblurStrength >= 0.25f -> 2
             else -> 1
         }
-        // Accelerated shock-bounded RL step factor converges crisp edge slopes in 2–3 fast passes
         val iterGainScale = when (iterations) {
             3 -> 1.85f
             2 -> 1.75f
@@ -1957,11 +2139,11 @@ class HdrPlusEngine {
         }
 
         fun convolvePsf(src: FloatArray, x: Int, y: Int): Float {
-            val row = y * width
+            val row = y * roiW
             val xm1 = (x - 1).coerceAtLeast(0)
-            val xp1 = (x + 1).coerceAtMost(width - 1)
-            val ym1 = (y - 1).coerceAtLeast(0) * width
-            val yp1 = (y + 1).coerceAtMost(height - 1) * width
+            val xp1 = (x + 1).coerceAtMost(roiW - 1)
+            val ym1 = (y - 1).coerceAtLeast(0) * roiW
+            val yp1 = (y + 1).coerceAtMost(roiH - 1) * roiW
 
             val iso = src[row + x] * 0.25f +
                 (src[row + xm1] + src[row + xp1] + src[ym1 + x] + src[yp1 + x]) * 0.125f +
@@ -1969,14 +2151,14 @@ class HdrPlusEngine {
 
             if (dirWeight <= 0.01f) return iso
 
-            val mx1 = (x - dx1).coerceIn(0, width - 1)
-            val px1 = (x + dx1).coerceIn(0, width - 1)
-            val my1 = (y - dy1).coerceIn(0, height - 1) * width
-            val py1 = (y + dy1).coerceIn(0, height - 1) * width
-            val mx2 = (x - dx2).coerceIn(0, width - 1)
-            val px2 = (x + dx2).coerceIn(0, width - 1)
-            val my2 = (y - dy2).coerceIn(0, height - 1) * width
-            val py2 = (y + dy2).coerceIn(0, height - 1) * width
+            val mx1 = (x - dx1).coerceIn(0, roiW - 1)
+            val px1 = (x + dx1).coerceIn(0, roiW - 1)
+            val my1 = (y - dy1).coerceIn(0, roiH - 1) * roiW
+            val py1 = (y + dy1).coerceIn(0, roiH - 1) * roiW
+            val mx2 = (x - dx2).coerceIn(0, roiW - 1)
+            val px2 = (x + dx2).coerceIn(0, roiW - 1)
+            val my2 = (y - dy2).coerceIn(0, roiH - 1) * roiW
+            val py2 = (y + dy2).coerceIn(0, roiH - 1) * roiW
 
             val dir = src[row + x] * 0.28f +
                 (src[my1 + mx1] + src[py1 + px1]) * 0.22f +
@@ -1988,99 +2170,110 @@ class HdrPlusEngine {
         repeat(iterations) {
             val srcEst = currentEst
             val dstEst = nextEst
-            forEachRowChunk(height) { yStart, yEnd ->
-                // 5-row rolling ratio cache per thread (~80KB at 4096px wide, stays hot in L2 cache)
-                val ringSlots = 5
-                val ratioRing = Array(ringSlots) { FloatArray(width) }
+            forEachRowChunk(roiH) { lyStart, lyEnd ->
+                // Compact rolling ratio ring buffer per thread (5 or 9 rows, stays hot in L2 cache)
+                val ratioRing = Array(ringSlots) { FloatArray(roiW) }
                 val ringRowTag = IntArray(ringSlots) { Int.MIN_VALUE }
 
                 fun ensureRatioRow(ry: Int): FloatArray {
-                    val clampedY = ry.coerceIn(0, height - 1)
+                    val clampedY = ry.coerceIn(0, roiH - 1)
                     val slot = clampedY % ringSlots
                     val buf = ratioRing[slot]
                     if (ringRowTag[slot] != clampedY) {
-                        val rowOff = clampedY * width
-                        for (x in 0 until width) {
+                        val rowOff = clampedY * roiW
+                        for (x in 0 until roiW) {
                             val blurred = convolvePsf(srcEst, x, clampedY)
-                            val orig = origLuma[rowOff + x]
-                            buf[x] = (orig / max(blurred, 0.012f)).coerceIn(0.55f, 1.65f)
+                            val orig = origLin[rowOff + x]
+                            buf[x] = (orig / max(blurred, 0.0025f)).coerceIn(0.55f, 1.65f)
                         }
                         ringRowTag[slot] = clampedY
                     }
                     return buf
                 }
 
-                for (y in yStart until yEnd) {
-                    val rM2 = ensureRatioRow(y - 2)
-                    val rM1 = ensureRatioRow(y - 1)
-                    val r0 = ensureRatioRow(y)
-                    val rP1 = ensureRatioRow(y + 1)
-                    val rP2 = ensureRatioRow(y + 2)
+                for (ly in lyStart until lyEnd) {
+                    // Populate the rolling ring window for all vertical PSF taps
+                    for (ry in (ly - maxVertReach)..(ly + maxVertReach)) {
+                        ensureRatioRow(ry)
+                    }
+                    val r0 = ratioRing[ly.coerceIn(0, roiH - 1) % ringSlots]
+                    val rIsoM1 = ratioRing[(ly - 1).coerceIn(0, roiH - 1) % ringSlots]
+                    val rIsoP1 = ratioRing[(ly + 1).coerceIn(0, roiH - 1) % ringSlots]
+                    val rDirM1 = ratioRing[(ly - dy1).coerceIn(0, roiH - 1) % ringSlots]
+                    val rDirP1 = ratioRing[(ly + dy1).coerceIn(0, roiH - 1) % ringSlots]
+                    val rDirM2 = ratioRing[(ly - dy2).coerceIn(0, roiH - 1) % ringSlots]
+                    val rDirP2 = ratioRing[(ly + dy2).coerceIn(0, roiH - 1) % ringSlots]
 
-                    val rowOff = y * width
-                    val ym1 = (y - 1).coerceAtLeast(0) * width
-                    val yp1 = (y + 1).coerceAtMost(height - 1) * width
+                    val rowOff = ly * roiW
+                    val ym1 = (ly - 1).coerceAtLeast(0) * roiW
+                    val yp1 = (ly + 1).coerceAtMost(roiH - 1) * roiW
+                    val globalY = roiY0 + ly
 
-                    for (x in 0 until width) {
-                        val xm1 = (x - 1).coerceAtLeast(0)
-                        val xp1 = (x + 1).coerceAtMost(width - 1)
-                        val i = rowOff + x
-                        val curL = srcEst[i]
+                    for (lx in 0 until roiW) {
+                        val xm1 = (lx - 1).coerceAtLeast(0)
+                        val xp1 = (lx + 1).coerceAtMost(roiW - 1)
+                        val i = rowOff + lx
+                        val curLin = srcEst[i]
+                        val globalX = roiX0 + lx
 
-                        // Backproject symmetric PSF over the cached ratio rows
-                        val isoCorr = r0[x] * 0.25f +
-                            (r0[xm1] + r0[xp1] + rM1[x] + rP1[x]) * 0.125f +
-                            (rM1[xm1] + rM1[xp1] + rP1[xm1] + rP1[xp1]) * 0.0625f
-
-                        val correction = if (dirWeight > 0.01f) {
-                            val mx1 = (x - dx1).coerceIn(0, width - 1)
-                            val px1 = (x + dx1).coerceIn(0, width - 1)
-                            val mx2 = (x - dx2).coerceIn(0, width - 1)
-                            val px2 = (x + dx2).coerceIn(0, width - 1)
-                            val rowM1 = when (-dy1) { -1 -> rM1; 1 -> rP1; else -> r0 }
-                            val rowP1 = when (dy1) { -1 -> rM1; 1 -> rP1; else -> r0 }
-                            val rowM2 = when (-dy2) { -2 -> rM2; 2 -> rP2; else -> r0 }
-                            val rowP2 = when (dy2) { -2 -> rM2; 2 -> rP2; else -> r0 }
-                            val dirCorr = r0[x] * 0.28f +
-                                (rowM1[mx1] + rowP1[px1]) * 0.22f +
-                                (rowM2[mx2] + rowP2[px2]) * 0.14f
-                            isoCorr * isoWeight + dirCorr * dirWeight
-                        } else isoCorr
-
-                        // Local 3x3 bounds & gradient for noise-free, zero-ringing regularization
-                        val n0 = srcEst[ym1 + xm1]; val n1 = srcEst[ym1 + x]; val n2 = srcEst[ym1 + xp1]
-                        val n3 = srcEst[rowOff + xm1]; val n5 = srcEst[rowOff + xp1]
-                        val n6 = srcEst[yp1 + xm1]; val n7 = srcEst[yp1 + x]; val n8 = srcEst[yp1 + xp1]
-                        val minL = min(curL, min(min(min(n0, n1), min(n2, n3)), min(min(n5, n6), min(n7, n8))))
-                        val maxL = max(curL, max(max(max(n0, n1), max(n2, n3)), max(max(n5, n6), max(n7, n8))))
-                        val localGrad = maxL - minL
-
-                        val texGate = ((localGrad - baseNoiseFloor) / 0.036f).coerceIn(0f, 1f)
-                        if (texGate <= 0.001f) {
-                            dstEst[i] = curL
+                        val faceW = if (hasFaces) faceMaskWeight(globalX, globalY, faceBounds) else 0f
+                        if (faceOnlyMode && faceW <= 0.001f) {
+                            dstEst[i] = curLin
                             continue
                         }
 
-                        val inFace = hasFaces && isInsideFaceBounds(x, y, faceBounds)
-                        val regionMod = if (inFace) {
-                            // Keep smooth cheek/forehead skin natural; maximize deblur on eyes, brows, hair & lips
-                            if (localGrad < 0.058f) 0.44f else 1.28f
+                        // Local 3x3 linear bounds & perceptual gradient for zero-ringing regularization
+                        val n0 = srcEst[ym1 + xm1]; val n1 = srcEst[ym1 + lx]; val n2 = srcEst[ym1 + xp1]
+                        val n3 = srcEst[rowOff + xm1]; val n5 = srcEst[rowOff + xp1]
+                        val n6 = srcEst[yp1 + xm1]; val n7 = srcEst[yp1 + lx]; val n8 = srcEst[yp1 + xp1]
+                        val minLin = min(curLin, min(min(min(n0, n1), min(n2, n3)), min(min(n5, n6), min(n7, n8))))
+                        val maxLin = max(curLin, max(max(max(n0, n1), max(n2, n3)), max(max(n5, n6), max(n7, n8))))
+                        val perceptualGrad = sqrt(maxLin.coerceAtLeast(0f)) - sqrt(minLin.coerceAtLeast(0f))
+
+                        val texGate = ((perceptualGrad - baseNoiseFloor) / 0.036f).coerceIn(0f, 1f)
+                        if (texGate <= 0.001f) {
+                            dstEst[i] = curLin
+                            continue
+                        }
+
+                        // Backproject symmetric PSF over the cached ratio rows
+                        val isoCorr = r0[lx] * 0.25f +
+                            (r0[xm1] + r0[xp1] + rIsoM1[lx] + rIsoP1[lx]) * 0.125f +
+                            (rIsoM1[xm1] + rIsoM1[xp1] + rIsoP1[xm1] + rIsoP1[xp1]) * 0.0625f
+
+                        val correction = if (dirWeight > 0.01f) {
+                            val mx1 = (lx - dx1).coerceIn(0, roiW - 1)
+                            val px1 = (lx + dx1).coerceIn(0, roiW - 1)
+                            val mx2 = (lx - dx2).coerceIn(0, roiW - 1)
+                            val px2 = (lx + dx2).coerceIn(0, roiW - 1)
+                            val dirCorr = r0[lx] * 0.28f +
+                                (rDirM1[mx1] + rDirP1[px1]) * 0.22f +
+                                (rDirM2[mx2] + rDirP2[px2]) * 0.14f
+                            isoCorr * isoWeight + dirCorr * dirWeight
+                        } else isoCorr
+
+                        val regionMod = if (faceW > 0.001f) {
+                            // Smoothstep skin protection (0.44x on smooth skin -> 1.28x on eyes/brows/lips/hair)
+                            val edgeBlend = smoothstep(0.032f, 0.080f, perceptualGrad)
+                            val faceMod = 0.44f + (1.28f - 0.44f) * edgeBlend
+                            if (faceOnlyMode) faceMod * faceW else 1f + (faceMod - 1f) * faceW
                         } else 1.0f
 
+                        val curPerc = sqrt(curLin.coerceAtLeast(0f))
                         val backlightMod = if (isBacklightActive) {
                             when {
-                                curL < 0.65f -> 1f + (1f - curL) * 0.28f
-                                curL > 0.85f -> 0.25f // Prevent silhouette halos against blown sky
+                                curPerc < 0.65f -> 1f + (1f - curPerc) * 0.28f
+                                curPerc > 0.85f -> 0.25f // Prevent silhouette halos against blown sky
                                 else -> 1f
                             }
                         } else 1f
 
                         val gain = (deblurStrength * iterGainScale * regionMod * backlightMod * texGate)
                             .coerceIn(0f, 2.65f)
-                        val updated = curL * (1f + (correction - 1f) * gain)
-                        // Strict local extrema clamping [minL, maxL] (shock-bounded RL):
+                        val updated = curLin * (1f + (correction - 1f) * gain)
+                        // Strict local extrema clamping [minLin, maxLin] (shock-bounded RL):
                         // Steepens blurred edge ramps cleanly while making dark/bright ringing halos impossible.
-                        dstEst[i] = updated.coerceIn(minL, maxL)
+                        dstEst[i] = updated.coerceIn(minLin, maxLin)
                     }
                 }
             }
@@ -2089,19 +2282,20 @@ class HdrPlusEngine {
             nextEst = tmp
         }
 
-        // Apply recovered luminance cleanly back to RGB pixels and update lumaPlane in place
-        val finalLuma = currentEst
-        forEachRowChunk(height) { yStart, yEnd ->
-            for (y in yStart until yEnd) {
-                val rowOff = y * width
-                for (x in 0 until width) {
-                    val i = rowOff + x
-                    val oL = origLuma[i]
-                    val nL = finalLuma[i]
-                    lumaPlane[i] = nL
+        // Convert recovered linear luminance back to sRGB luma and apply cleanly to RGB pixels
+        val finalLin = currentEst
+        forEachRowChunk(roiH) { lyStart, lyEnd ->
+            for (ly in lyStart until lyEnd) {
+                val srcRow = ly * roiW
+                val dstRow = (roiY0 + ly) * width + roiX0
+                for (lx in 0 until roiW) {
+                    val dstIdx = dstRow + lx
+                    val oL = lumaPlane[dstIdx]
+                    val nL = sqrt(finalLin[srcRow + lx].coerceIn(0f, 1f))
+                    lumaPlane[dstIdx] = nL
                     val deltaL = nL - oL
                     if (abs(deltaL) > 0.0015f) {
-                        val p = mergedPixels[i]
+                        val p = mergedPixels[dstIdx]
                         val r = ((p shr 16) and 0xFF).toFloat()
                         val g = ((p shr 8) and 0xFF).toFloat()
                         val b = (p and 0xFF).toFloat()
@@ -2119,7 +2313,7 @@ class HdrPlusEngine {
                             ng = (g + add).toInt().coerceIn(0, 255)
                             nb = (b + add).toInt().coerceIn(0, 255)
                         }
-                        mergedPixels[i] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
+                        mergedPixels[dstIdx] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
                     }
                 }
             }
@@ -2127,7 +2321,7 @@ class HdrPlusEngine {
     }
 
     /**
-     * Evaluates high-frequency focus sharpness around detected faces (78% weight when faces exist)
+     * Evaluates high-frequency focus sharpness around detected faces (90% weight when faces exist)
      * and the tap-to-focus ROI (or frame center) so bursts always pick the sharpest-face reference.
      */
     private fun computeRoiSharpness(

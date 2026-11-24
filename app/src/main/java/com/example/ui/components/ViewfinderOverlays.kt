@@ -837,6 +837,8 @@ fun FaceDetectionOverlay(
 
     if (faces.isEmpty()) return
 
+    val bracketPath = remember { Path() }
+
     Canvas(
         modifier = modifier
             .fillMaxSize()
@@ -865,48 +867,31 @@ fun FaceDetectionOverlay(
             val cornerLen = (minOf(boxW, boxH) * 0.24f).coerceIn(10.dp.toPx(), 24.dp.toPx())
             val cornerR = (cornerLen * 0.48f).coerceAtLeast(4.dp.toPx())
 
-            // Draw subtle rounded corner brackets (clean viewfinder look without obscuring faces)
+            // Draw all 4 subtle rounded corner brackets using a single reused Path (zero per-frame allocations)
+            bracketPath.reset()
             // Top-Left
-            drawPath(
-                path = Path().apply {
-                    moveTo(left, top + cornerLen)
-                    lineTo(left, top + cornerR)
-                    quadraticTo(left, top, left + cornerR, top)
-                    lineTo(left + cornerLen, top)
-                },
-                color = color,
-                style = Stroke(width = strokePx, cap = StrokeCap.Round),
-            )
+            bracketPath.moveTo(left, top + cornerLen)
+            bracketPath.lineTo(left, top + cornerR)
+            bracketPath.quadraticTo(left, top, left + cornerR, top)
+            bracketPath.lineTo(left + cornerLen, top)
             // Top-Right
-            drawPath(
-                path = Path().apply {
-                    moveTo(right - cornerLen, top)
-                    lineTo(right - cornerR, top)
-                    quadraticTo(right, top, right, top + cornerR)
-                    lineTo(right, top + cornerLen)
-                },
-                color = color,
-                style = Stroke(width = strokePx, cap = StrokeCap.Round),
-            )
+            bracketPath.moveTo(right - cornerLen, top)
+            bracketPath.lineTo(right - cornerR, top)
+            bracketPath.quadraticTo(right, top, right, top + cornerR)
+            bracketPath.lineTo(right, top + cornerLen)
             // Bottom-Left
-            drawPath(
-                path = Path().apply {
-                    moveTo(left, bottom - cornerLen)
-                    lineTo(left, bottom - cornerR)
-                    quadraticTo(left, bottom, left + cornerR, bottom)
-                    lineTo(left + cornerLen, bottom)
-                },
-                color = color,
-                style = Stroke(width = strokePx, cap = StrokeCap.Round),
-            )
+            bracketPath.moveTo(left, bottom - cornerLen)
+            bracketPath.lineTo(left, bottom - cornerR)
+            bracketPath.quadraticTo(left, bottom, left + cornerR, bottom)
+            bracketPath.lineTo(left + cornerLen, bottom)
             // Bottom-Right
+            bracketPath.moveTo(right - cornerLen, bottom)
+            bracketPath.lineTo(right - cornerR, bottom)
+            bracketPath.quadraticTo(right, bottom, right, bottom - cornerR)
+            bracketPath.lineTo(right, bottom - cornerLen)
+
             drawPath(
-                path = Path().apply {
-                    moveTo(right - cornerLen, bottom)
-                    lineTo(right - cornerR, bottom)
-                    quadraticTo(right, bottom, right, bottom - cornerR)
-                    lineTo(right, bottom - cornerLen)
-                },
+                path = bracketPath,
                 color = color,
                 style = Stroke(width = strokePx, cap = StrokeCap.Round),
             )

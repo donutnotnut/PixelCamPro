@@ -17,7 +17,9 @@ import android.os.Build
 import android.util.Log
 import android.util.Range
 import android.util.Size
+import android.view.Surface
 import android.view.TextureView
+import java.lang.ref.WeakReference
 import androidx.annotation.OptIn
 import androidx.camera.camera2.interop.Camera2CameraControl
 import androidx.camera.camera2.interop.Camera2CameraInfo
@@ -196,6 +198,10 @@ class CameraController(private val context: Context) {
     @Volatile
     private var activeSensorArray: Rect? = null
     @Volatile
+    private var activeDisplayRotation: Int = Surface.ROTATION_0
+    @Volatile
+    private var boundPreviewViewRef: WeakReference<PreviewView>? = null
+    @Volatile
     private var activeAspectRatioMode: AspectRatioMode = AspectRatioMode.RATIO_4_3
     @Volatile
     private var activeFaceDetectEnabled: Boolean = true
@@ -265,6 +271,8 @@ class CameraController(private val context: Context) {
         currentLensFacing = lensFacing
         activeAspectRatioMode = aspectRatioMode
         activeFaceDetectEnabled = faceDetectionEnabled
+        boundPreviewViewRef = WeakReference(previewView)
+        activeDisplayRotation = previewView.display?.rotation ?: Surface.ROTATION_0
         onFacesDetectedCallback = onFacesDetected
         smoothedFaces = emptyList()
         onFacesDetected(emptyList())
@@ -385,7 +393,12 @@ class CameraController(private val context: Context) {
             }
 
             val (probedFaceMode, probedOrientation, probedArray) = probeFaceDetectConfig(provider, selector)
-            activeFaceDetectMode = probedFaceMode
+            val appliedFaceMode = if (faceDetectionEnabled) {
+                probedFaceMode
+            } else {
+                CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF
+            }
+            activeFaceDetectMode = appliedFaceMode
             activeSensorOrientation = probedOrientation
             activeSensorArray = probedArray
 
@@ -396,7 +409,7 @@ class CameraController(private val context: Context) {
             if (probedFaceMode != CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF) {
                 previewExtender.setCaptureRequestOption(
                     CaptureRequest.STATISTICS_FACE_DETECT_MODE,
-                    probedFaceMode,
+                    appliedFaceMode,
                 )
             }
             preview = previewBuilder
@@ -409,8 +422,13 @@ class CameraController(private val context: Context) {
             val useNativeUltraHdr = nativeUltraHdrRequested && nativeUltraHdrSupported
 
             fun buildStandardImageCapture(enableUltraHdr: Boolean): ImageCapture {
+                // Use MINIMIZE_LATENCY for the custom computational engine:
+                // 1. Keeps full 12.5MP resolution and JPEG quality 97.
+                // 2. Eliminates CameraX's 5-second per-frame 3A convergence timeout during manual
+                //    Night Sight (CONTROL_AE_MODE_OFF) and prevents slow per-frame vendor HQ stalls
+                //    when capturing multi-frame HDR+ / Night Sight bursts.
                 val builder = ImageCapture.Builder()
-                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                     .setResolutionSelector(captureResolutionSelector)
                     .setJpegQuality(97)
                     .setFlashMode(mapFlashMode(flashMode))
@@ -642,10 +660,39 @@ class CameraController(private val context: Context) {
                 }
 
                 val isFront = currentLensFacing == CameraSelector.LENS_FACING_FRONT
+                val displayRotation = boundPreviewViewRef?.get()?.display?.rotation ?: activeDisplayRotation
+                activeDisplayRotation = displayRotation
+                val isLandscape = displayRotation == Surface.ROTATION_90 || displayRotation == Surface.ROTATION_270
                 val targetUprightAspect = when (activeAspectRatioMode) {
-                    AspectRatioMode.RATIO_4_3 -> 3f / 4f
-                    AspectRatioMode.RATIO_16_9 -> 9f / 16f
+                    AspectRatioMode.RATIO_4_3 -> if (isLandscape) 4f / 3f else 3f / 4f
+                    AspectRatioMode.RATIO_16_9 -> if (isLandscape) 16f / 9f else 9f / 16f
                 }
+                val relativeRotation = runCatching {
+                    boundCamera?.cameraInfo?.getSensorRotationDegrees(displayRotation)
+                }.getOrNull() ?: run {
+                    val displayDeg = when (displayRotation) {
+                        Surface.ROTATION_90 -> 90
+                        Surface.ROTATION_180 -> 180
+                        Surface.ROTATION_270 -> 270
+                        else -> 0
+                    }
+                    if (isFront) {
+                        (activeSensorOrientation + displayDeg) % 360
+                    } else {
+                        (activeSensorOrientation - displayDeg + 360) % 360
+                    }
+                }
+                val rawZoomRatio = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    result.get(CaptureResult.CONTROL_ZOOM_RATIO)
+                } else null
+                val activeArr = activeSensorArray
+                val alreadyCroppedByScaler = activeArr != null &&
+                    activeArr.width() > 0 &&
+                    cropRect.width() < (activeArr.width() * 0.98f)
+                val effectiveZoomRatio = if (!alreadyCroppedByScaler && rawZoomRatio != null && rawZoomRatio > 1.01f) {
+                    rawZoomRatio
+                } else 1f
+
                 val mapped = ArrayList<DetectedFace>(hwFaces.size)
                 for (i in hwFaces.indices) {
                     val face = hwFaces[i]
@@ -660,9 +707,10 @@ class CameraController(private val context: Context) {
                         cropTop = cropRect.top,
                         cropRight = cropRect.right,
                         cropBottom = cropRect.bottom,
-                        sensorOrientationDegrees = activeSensorOrientation,
+                        sensorOrientationDegrees = relativeRotation,
                         mirrorHorizontally = isFront,
                         targetUprightAspect = targetUprightAspect,
+                        zoomRatio = effectiveZoomRatio,
                         faceId = if (face.id >= 0) face.id else i,
                         score = face.score,
                     )
@@ -1203,16 +1251,20 @@ class CameraController(private val context: Context) {
             return
         }
 
-        // Only trigger fast center AF fallback if sensor explicitly reports unfocused state
+        // Only trigger fast AF fallback if sensor explicitly reports unfocused state;
+        // prioritize the primary detected face center over frame center when a face is tracked.
         val isExplicitlyUnfocused = af == CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED ||
             af == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED
         if (isExplicitlyUnfocused && previewView != null && previewView.width > 0 && previewView.height > 0) {
-            val centerPoint = previewView.meteringPointFactory.createPoint(
-                previewView.width * 0.5f,
-                previewView.height * 0.5f,
+            val primaryFace = if (activeFaceDetectEnabled) smoothedFaces.firstOrNull() else null
+            val targetNormX = primaryFace?.centerX?.coerceIn(0.10f, 0.90f) ?: 0.5f
+            val targetNormY = primaryFace?.centerY?.coerceIn(0.10f, 0.90f) ?: 0.5f
+            val targetPoint = previewView.meteringPointFactory.createPoint(
+                previewView.width * targetNormX,
+                previewView.height * targetNormY,
             )
             val action = FocusMeteringAction.Builder(
-                centerPoint,
+                targetPoint,
                 FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE
             )
                 .setAutoCancelDuration(3, TimeUnit.SECONDS)
@@ -1581,26 +1633,28 @@ class CameraController(private val context: Context) {
 
             suspend fun waitForExposureSettle(targetExposureNs: Long) {
                 if (!appliedOverride) return
-                val targetExpMs = (targetExposureNs / 1_000_000L).coerceIn(60L, 450L)
+                val targetExpMs = (targetExposureNs / 1_000_000L).coerceIn(50L, 280L)
                 if (useManualLongShutter) {
-                    val settleDeadline = System.currentTimeMillis() + (targetExpMs + 150L).coerceAtMost(540L)
+                    val settleDeadline = System.currentTimeMillis() + (targetExpMs + 90L).coerceAtMost(320L)
                     while (System.currentTimeMillis() < settleDeadline) {
                         val liveExp = lastExposureTimeNs
                         if (liveExp != null && kotlin.math.abs(liveExp - targetExposureNs) <= (targetExposureNs * 0.30f).toLong()) {
                             break
                         }
-                        delay(25L)
+                        delay(20L)
                     }
                 } else {
-                    delay(240L)
+                    delay(160L)
                 }
             }
 
             try {
                 waitForExposureSettle(activePlan.perFrameExposureNs)
 
-                val targetHoldMs = activePlan.estimatedTotalHoldMs.coerceAtLeast(1000L)
-                var minInterFrameMs = (activePlan.perFrameExposureNs / 1_000_000L).coerceIn(80L, 360L)
+                val targetHoldMs = activePlan.estimatedTotalHoldMs.coerceAtLeast(800L)
+                // Hard real-time ceiling so even a slow HAL never traps the user for 10-60s
+                val maxHoldBudgetMs = (targetHoldMs + 1400L).coerceIn(2800L, 4200L)
+                var minInterFrameMs = (activePlan.perFrameExposureNs / 1_000_000L).coerceIn(60L, 240L)
 
                 coroutineScope {
                     val tickerJob = launch {
@@ -1631,22 +1685,22 @@ class CameraController(private val context: Context) {
                             val frame = withContext(Dispatchers.Default) {
                                 extractRawFrameAndClose(imageProxy, mirror, maxLongEdge = MAX_CAPTURE_LONG_EDGE)
                             }
+                            val frameElapsed = System.currentTimeMillis() - frameStartMs
 
-                            // Closed-loop auto-metering on Frame 1: measure actual captured brightness
-                            // right off the ISP so hardware quirks or unexpected still-capture gain
-                            // can NEVER produce an overexposed Night Sight photo!
-                            if (!didClosedLoopCorrection && rawFrames.isEmpty() && appliedOverride) {
+                            // Closed-loop auto-metering on Frame 1 (only when the HAL is fast enough
+                            // that discarding 1 probe frame stays well within our handheld time budget).
+                            if (!didClosedLoopCorrection && rawFrames.isEmpty() && appliedOverride && frameElapsed < 1400L) {
                                 didClosedLoopCorrection = true
                                 val (frameLuma, frameClippedPct) = withContext(Dispatchers.Default) {
                                     measureQuickFrameBrightness(frame)
                                 }
-                                val isOverexposed = frameLuma > 0.48f || frameClippedPct > 10f
-                                val isSeverelyUnderexposed = frameLuma < 0.11f && frameClippedPct < 1f
+                                val isOverexposed = frameLuma > 0.54f || frameClippedPct > 14f
+                                val isSeverelyUnderexposed = frameLuma < 0.09f && frameClippedPct < 1f
                                 if (isOverexposed || isSeverelyUnderexposed) {
                                     val linearScale = if (isOverexposed) {
                                         val ratio = (0.34f / frameLuma.coerceAtLeast(0.36f)).coerceIn(0.20f, 0.86f)
-                                        val clipPenalty = if (frameClippedPct > 10f) {
-                                            (1f - ((frameClippedPct - 10f) / 38f)).coerceIn(0.45f, 0.88f)
+                                        val clipPenalty = if (frameClippedPct > 14f) {
+                                            (1f - ((frameClippedPct - 14f) / 38f)).coerceIn(0.45f, 0.88f)
                                         } else 1f
                                         (ratio * ratio * clipPenalty).coerceIn(0.14f, 0.80f)
                                     } else {
@@ -1659,7 +1713,7 @@ class CameraController(private val context: Context) {
                                         isoRange = caps.isoRange,
                                         exposureTimeRangeNs = caps.exposureTimeRangeNs,
                                     )
-                                    minInterFrameMs = (activePlan.perFrameExposureNs / 1_000_000L).coerceIn(60L, 360L)
+                                    minInterFrameMs = (activePlan.perFrameExposureNs / 1_000_000L).coerceIn(60L, 240L)
                                     appliedOverride = applyNightSightHardwareRequest(
                                         camera = camera,
                                         caps = caps,
@@ -1677,9 +1731,14 @@ class CameraController(private val context: Context) {
                             rawFrames.add(frame)
                             capturedCount = rawFrames.size
 
-                            val frameElapsed = System.currentTimeMillis() - frameStartMs
-                            if (rawFrames.size < activePlan.frameCount && frameElapsed < minInterFrameMs) {
-                                delay((minInterFrameMs - frameElapsed).coerceAtMost(240L))
+                            // Adaptive wall-clock hold cap: if this device's HAL takes longer than expected
+                            // per capture, finish cleanly once we have enough frames instead of hanging.
+                            val totalElapsedMs = System.currentTimeMillis() - holdStartMs
+                            val minFrames = if (frameElapsed >= 2500L) 1 else 2
+                            if (rawFrames.size >= minFrames &&
+                                (totalElapsedMs >= maxHoldBudgetMs || totalElapsedMs + frameElapsed > maxHoldBudgetMs + 900L)
+                            ) {
+                                break
                             }
                         }
                     } finally {
@@ -1736,7 +1795,7 @@ class CameraController(private val context: Context) {
                 .coerceIn(exposureTimeRangeNs.first, exposureTimeRangeNs.last)
         } else {
             (plan.perFrameExposureNs * sqrt(linearScale.toDouble())).toLong()
-                .coerceIn(exposureTimeRangeNs.first, exposureTimeRangeNs.last.coerceAtMost(450_000_000L))
+                .coerceIn(exposureTimeRangeNs.first, exposureTimeRangeNs.last.coerceAtMost(280_000_000L))
         }
         val newIso = (newProduct / newExpNs.toDouble()).roundToInt().coerceIn(minIso, maxIso)
         val deltaEv = (kotlin.math.ln(linearScale.toDouble()) / kotlin.math.ln(2.0)).toFloat()
@@ -1860,7 +1919,8 @@ class CameraController(private val context: Context) {
                 )
             }
 
-            manualSettings.whiteBalanceKelvin?.let { kelvin ->
+            if (manualSettings.whiteBalanceKelvin != null) {
+                val kelvin = manualSettings.whiteBalanceKelvin
                 val (r, g, b) = KelvinColorMath.kelvinToRgbGains(kelvin)
                 builder.setCaptureRequestOption(
                     CaptureRequest.CONTROL_AWB_MODE,
@@ -1874,6 +1934,10 @@ class CameraController(private val context: Context) {
                     CaptureRequest.COLOR_CORRECTION_GAINS,
                     RggbChannelVector(r, g, g, b),
                 )
+            } else {
+                // Lock AWB across Night Sight burst frames so white balance stays consistent
+                // and Camera2 never stalls waiting for AWB re-convergence between frames.
+                builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, true)
             }
 
             val future = c2Control.setCaptureRequestOptions(builder.build())

@@ -346,7 +346,8 @@ private fun CameraScreenContent(
     }
 
     // Rebind CameraX whenever lens facing, discrete physical camera ID, aspect ratio,
-    // Pixel Camera Services toggle, target Extension mode, or native Ultra HDR capture format changes
+    // Pixel Camera Services toggle, target Extension mode, native Ultra HDR format, or
+    // hardware face-detection mode changes
     LaunchedEffect(
         uiState.lensFacing,
         uiState.preferredCameraId,
@@ -354,6 +355,7 @@ private fun CameraScreenContent(
         uiState.pixelCameraServicesEnabled,
         uiState.desiredPixelExtensionMode,
         uiState.wantsNativeUltraHdrCapture,
+        uiState.hdrConfig.faceDetectionEnabled,
     ) {
         viewModel.bindCamera(lifecycleOwner, previewView)
     }

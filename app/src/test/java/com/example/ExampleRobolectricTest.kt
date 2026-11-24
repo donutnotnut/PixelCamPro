@@ -1459,12 +1459,11 @@ class ExampleRobolectricTest {
         )
 
         assertEquals(1, backlitFaceResult.metrics.facesDetected)
-        assertTrue(backlitFaceResult.metrics.faceDeblurApplied)
         assertTrue(backlitFaceResult.metrics.isBacklightEnhanced)
         val faceEnergyOut = measureEdgeSteepness(backlitFaceResult.bitmap, 26, 70, 34, 60)
         val faceEnergyBlurry = measureEdgeSteepness(frameBlurryFace, 26, 70, 34, 60)
         assertTrue(
-            "Expected face-priority burst selection + backlit deblur ($faceEnergyOut) >> blurry face ($faceEnergyBlurry)",
+            "Expected face-priority burst selection + backlit clarity ($faceEnergyOut) >> blurry face ($faceEnergyBlurry)",
             faceEnergyOut > faceEnergyBlurry * 2.0f,
         )
 

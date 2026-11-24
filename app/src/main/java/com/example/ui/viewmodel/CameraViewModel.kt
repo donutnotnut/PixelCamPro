@@ -1589,6 +1589,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             var capturedFrames: List<RawCapturedFrame> = emptyList()
             var handedOffToQueue = false
             try {
+                // Snapshot tracked face ROIs right at shutter press BEFORE the multi-frame burst runs
+                // so lowering the phone or subject motion after capture never yields stale/empty boxes.
+                val preCaptureFaces = if (effectiveHdrConfig.faceDetectionEnabled) {
+                    cameraController.getCaptureFaces(effectiveHdrConfig.mirrorFrontCamera)
+                } else emptyList()
+
                 val activeLookName = snapshot.activePreset?.name
                     ?: if (snapshot.manualSettings.isAnyToneOverride) "Custom Tone" else "Default"
                 val focusNorm = snapshot.focusReticle?.let { it.normX to it.normY }
@@ -1707,7 +1713,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 }
 
                 val captureFaces = if (effectiveHdrConfig.faceDetectionEnabled) {
-                    cameraController.getCaptureFaces(effectiveHdrConfig.mirrorFrontCamera)
+                    preCaptureFaces.ifEmpty {
+                        cameraController.getCaptureFaces(effectiveHdrConfig.mirrorFrontCamera)
+                    }
                 } else emptyList()
                 val job = PendingRenderJob(
                     rawFrames = capturedFrames,
