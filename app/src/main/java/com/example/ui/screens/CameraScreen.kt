@@ -135,7 +135,6 @@ import com.example.camera.model.HdrMode
 import com.example.camera.model.LensOption
 import com.example.camera.model.LowLightDetector
 import com.example.camera.model.NightSightMode
-import com.example.camera.model.PixelExtensionMode
 import com.example.camera.model.TimerDuration
 import com.example.camera.model.ToneColorMath
 import com.example.camera.model.ToneShaderMath
@@ -147,6 +146,7 @@ import com.example.ui.components.ExpressiveHaptic
 import com.example.ui.components.ExpressiveIconButton
 import com.example.ui.components.ExpressiveLoadingIndicator
 import com.example.ui.components.ExpressiveOutlinedButton
+import com.example.ui.components.ExpressivePillChip
 import com.example.ui.components.ExpressiveSegmentedGroup
 import com.example.ui.components.ExpressiveShapes
 import com.example.ui.components.ExpressiveSlider
@@ -688,60 +688,6 @@ private fun CameraScreenContent(
                     .weight(1f)
                     .fillMaxWidth(),
             ) {
-                // Active Pixel Camera Services badge on the viewfinder (tap to jump to Settings)
-                androidx.compose.animation.AnimatedVisibility(
-                    visible = uiState.isPixelServicesActive && !uiState.isQuickSettingsExpanded,
-                    enter = fadeIn(M3ExpressiveMotion.fastEffects()) +
-                        scaleIn(initialScale = 0.88f, animationSpec = M3ExpressiveMotion.fastSpatial()),
-                    exit = fadeOut(M3ExpressiveMotion.fastEffects()) +
-                        scaleOut(targetScale = 0.88f, animationSpec = M3ExpressiveMotion.fastEffects()),
-                    modifier = Modifier
-                        .align(Alignment.TopStart)
-                        .padding(top = 10.dp, start = 12.dp),
-                ) {
-                    val displayMode = if (uiState.activePixelExtensionMode != PixelExtensionMode.NONE) {
-                        uiState.activePixelExtensionMode
-                    } else {
-                        uiState.desiredPixelExtensionMode
-                    }
-                    Surface(
-                        onClick = {
-                            haptics.tick()
-                            viewModel.setSettingsSheetOpen(true)
-                        },
-                        shape = CircleShape,
-                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.90f),
-                        tonalElevation = 0.dp,
-                        shadowElevation = 0.dp,
-                        modifier = Modifier
-                            .border(
-                                1.dp,
-                                MaterialTheme.colorScheme.primary.copy(alpha = 0.55f),
-                                CircleShape,
-                            )
-                            .semantics(mergeDescendants = true) {}
-                            .testTag("pixel_services_viewfinder_badge"),
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(5.dp),
-                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.AutoAwesome,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                                modifier = Modifier.size(14.dp),
-                            )
-                            Text(
-                                text = displayMode.badge.ifBlank { "Pixel Services" },
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer,
-                            )
-                        }
-                    }
-                }
-
                 androidx.compose.animation.AnimatedVisibility(
                     visible = uiState.showHistogram && uiState.isAnalysisActiveInSession && !uiState.isPixelServicesLocked,
                     enter = fadeIn(M3ExpressiveMotion.fastEffects()) +
@@ -835,7 +781,7 @@ private fun CameraScreenContent(
                     }
                 }
 
-                // Pixel-style Auto Night Sight Indicator Pill (tap to pause/dismiss Night Sight)
+                // Material You 3 Expressive Night Sight Indicator Pill (tap to pause/dismiss Night Sight)
                 val showNightSightPill = uiState.isNightSightActive &&
                     bannerText == null &&
                     !anyFloatingDrawerOpen &&
@@ -843,9 +789,9 @@ private fun CameraScreenContent(
                     !uiState.isQuickSettingsExpanded
                 androidx.compose.animation.AnimatedVisibility(
                     visible = showNightSightPill,
-                    enter = fadeIn(tween(160)) +
+                    enter = fadeIn(M3ExpressiveMotion.fastEffects()) +
                         scaleIn(initialScale = 0.90f, animationSpec = M3ExpressiveMotion.fastSpatial()),
-                    exit = fadeOut(tween(120)) +
+                    exit = fadeOut(M3ExpressiveMotion.fastEffects()) +
                         scaleOut(targetScale = 0.92f, animationSpec = M3ExpressiveMotion.fastEffects()),
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
@@ -858,41 +804,24 @@ private fun CameraScreenContent(
                         uiState.nightSightMode == NightSightMode.ON -> "Night Sight • $holdTag"
                         else -> "Low Light • $holdTag"
                     }
-                    Surface(
-                        onClick = {
-                            haptics.tick()
-                            viewModel.toggleNightSightQuick()
+                    ExpressivePillChip(
+                        label = label,
+                        selected = true,
+                        leadingIcon = if (uiState.isPixelServicesActive || uiState.nightSightMode == NightSightMode.ON) {
+                            Icons.Rounded.NightsStay
+                        } else {
+                            Icons.Rounded.Bedtime
                         },
-                        shape = CircleShape,
-                        color = Color(0xCC1E1A10),
-                        tonalElevation = 0.dp,
-                        shadowElevation = 0.dp,
-                        modifier = Modifier
-                            .border(1.dp, PixelAmber.copy(alpha = 0.55f), CircleShape)
-                            .semantics(mergeDescendants = true) {}
-                            .testTag("night_sight_indicator_pill"),
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            modifier = Modifier.padding(horizontal = 13.dp, vertical = 7.dp),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.Bedtime,
-                                contentDescription = null,
-                                tint = PixelAmber,
-                                modifier = Modifier.size(15.dp),
-                            )
-                            Text(
-                                text = label,
-                                style = MaterialTheme.typography.labelMedium,
-                                color = PixelAmber,
-                            )
-                        }
-                    }
+                        selectedContainerColor = MaterialTheme.colorScheme.secondaryContainer,
+                        selectedContentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                        selectedCornerRadius = 24.dp,
+                        onClick = viewModel::toggleNightSightQuick,
+                        modifier = Modifier.semantics(mergeDescendants = true) {},
+                        testTag = "night_sight_indicator_pill",
+                    )
                 }
 
-                // Pixel-style Backlight Picture Indicator Pill (Anti-Glare & Dehaze indicator)
+                // Material You 3 Expressive Backlight Picture Indicator Pill (Anti-Glare & Dehaze indicator)
                 val showBacklightPill = uiState.isBacklightActive &&
                     !uiState.isNightSightActive &&
                     bannerText == null &&
@@ -901,9 +830,9 @@ private fun CameraScreenContent(
                     !uiState.isQuickSettingsExpanded
                 androidx.compose.animation.AnimatedVisibility(
                     visible = showBacklightPill,
-                    enter = fadeIn(tween(160)) +
+                    enter = fadeIn(M3ExpressiveMotion.fastEffects()) +
                         scaleIn(initialScale = 0.90f, animationSpec = M3ExpressiveMotion.fastSpatial()),
-                    exit = fadeOut(tween(120)) +
+                    exit = fadeOut(M3ExpressiveMotion.fastEffects()) +
                         scaleOut(targetScale = 0.92f, animationSpec = M3ExpressiveMotion.fastEffects()),
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
@@ -915,38 +844,17 @@ private fun CameraScreenContent(
                         BacklightMode.AUTO -> if (hasFace) "Backlight Face • Anti-Glare & Deblur" else "Backlight Scene • Anti-Glare Active"
                         BacklightMode.OFF -> "Backlight Off"
                     }
-                    Surface(
-                        onClick = {
-                            haptics.tick()
-                            viewModel.toggleBacklightModeQuick()
-                        },
-                        shape = CircleShape,
-                        color = Color(0xCC201A12),
-                        tonalElevation = 0.dp,
-                        shadowElevation = 0.dp,
-                        modifier = Modifier
-                            .border(1.dp, PixelAmber.copy(alpha = 0.65f), CircleShape)
-                            .semantics(mergeDescendants = true) {}
-                            .testTag("backlight_indicator_pill"),
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            modifier = Modifier.padding(horizontal = 13.dp, vertical = 7.dp),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.WbSunny,
-                                contentDescription = null,
-                                tint = PixelAmber,
-                                modifier = Modifier.size(15.dp),
-                            )
-                            Text(
-                                text = label,
-                                style = MaterialTheme.typography.labelMedium,
-                                color = PixelAmber,
-                            )
-                        }
-                    }
+                    ExpressivePillChip(
+                        label = label,
+                        selected = true,
+                        leadingIcon = Icons.Rounded.WbSunny,
+                        selectedContainerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                        selectedContentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+                        selectedCornerRadius = 24.dp,
+                        onClick = viewModel::toggleBacklightModeQuick,
+                        modifier = Modifier.semantics(mergeDescendants = true) {},
+                        testTag = "backlight_indicator_pill",
+                    )
                 }
 
                 // Pure-GPU floating menus above the anchored lens row (ZERO sibling or shutter deck relayout!)
