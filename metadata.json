@@ -1,0 +1,10 @@
+{
+  "name": "PixelCam Pro",
+  "description": "Computational photography camera app with live viewfinder, Pixel 11 Pro HDR+ Enhanced multi-frame processing, manual exposure controls, and Pixel Camera Looks.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

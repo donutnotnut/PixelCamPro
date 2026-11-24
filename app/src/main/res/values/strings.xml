@@ -1,0 +1,28 @@
+<resources>
+    <string name="app_name">PixelCam Pro</string>
+    <string name="camera_permission_title">Camera Access Required</string>
+    <string name="camera_permission_rationale">PixelCam Pro needs camera access to power the live computational viewfinder, HDR+ Enhanced multi-frame capture, and manual Pro exposure controls.</string>
+    <string name="grant_camera_permission">Enable Camera</string>
+    <string name="open_app_settings">Open Settings</string>
+    <string name="mode_camera">Photo</string>
+    <string name="hdr_off">Off</string>
+    <string name="hdr_auto">HDR+</string>
+    <string name="hdr_enhanced">HDR+ Enh</string>
+    <string name="pro_controls_title">Pro Controls</string>
+    <string name="reset_auto">Auto Reset</string>
+    <string name="looks_title">Pixel Looks</string>
+    <string name="settings_title">Camera Settings</string>
+    <string name="gallery_inspector_title">Computational Inspector</string>
+    <string name="no_photos_captured">Capture a frame to inspect HDR+ pipeline telemetry, histogram, and EXIF metadata.</string>
+    <string name="cd_shutter_button">Capture photo</string>
+    <string name="cd_switch_camera">Switch front and back camera</string>
+    <string name="cd_open_gallery">Open captured photo inspector</string>
+    <string name="cd_pro_controls">Toggle Pro manual controls</string>
+    <string name="cd_looks_picker">Toggle Pixel 11 Looks</string>
+    <string name="cd_settings">Open camera settings</string>
+    <string name="cd_flash">Cycle flash mode</string>
+    <string name="cd_night_sight">Cycle low light Night Sight mode</string>
+    <string name="cd_close">Close</string>
+    <string name="cd_share_photo">Share photo</string>
+    <string name="cd_delete_photo">Delete photo</string>
+</resources>
