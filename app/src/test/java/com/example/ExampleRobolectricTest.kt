@@ -1119,28 +1119,28 @@ class ExampleRobolectricTest {
         assertEquals(com.example.camera.model.PixelExtensionMode.NONE, pixel10NightOff.desiredPixelExtensionMode)
         assertTrue(pixel10NightOff.wantsNativeUltraHdrCapture)
 
-        // 2. Multi-extension device (supports AUTO, HDR, and NIGHT)
-        val multiExtState = com.example.ui.viewmodel.CameraUiState(
+        // 2. Daylight & Backlight ALWAYS stay on custom pipeline even with Pixel Camera Services ON
+        val daylightWithPixelServicesAndBacklight = com.example.ui.viewmodel.CameraUiState(
             pixelCameraServicesEnabled = true,
             pixelExtensionsSupported = true,
-            supportedPixelExtensions = setOf(
-                com.example.camera.model.PixelExtensionMode.AUTO,
-                com.example.camera.model.PixelExtensionMode.HDR,
-                com.example.camera.model.PixelExtensionMode.NIGHT,
-            ),
+            supportedPixelExtensions = setOf(com.example.camera.model.PixelExtensionMode.NIGHT),
             hasCheckedPixelExtensions = true,
             nightSightMode = com.example.camera.model.NightSightMode.AUTO,
+            isLowLightDetected = false,
+            isBacklitDetected = true,
             hdrMode = com.example.camera.model.HdrMode.HDR_PLUS_ENHANCED,
+            hdrConfig = HdrPipelineConfig(backlightMode = BacklightMode.AUTO),
         )
-        assertFalse(multiExtState.isPixelNightOnlyDevice)
-        assertEquals(com.example.camera.model.PixelExtensionMode.AUTO, multiExtState.desiredPixelExtensionMode)
+        assertEquals(com.example.camera.model.PixelExtensionMode.NONE, daylightWithPixelServicesAndBacklight.desiredPixelExtensionMode)
+        assertFalse(daylightWithPixelServicesAndBacklight.isPixelServicesLocked)
+        assertTrue(daylightWithPixelServicesAndBacklight.isBacklightActive)
         assertEquals(
-            com.example.camera.model.PixelExtensionMode.HDR,
-            multiExtState.copy(nightSightMode = com.example.camera.model.NightSightMode.OFF).desiredPixelExtensionMode,
+            com.example.camera.model.PixelExtensionMode.NONE,
+            daylightWithPixelServicesAndBacklight.copy(nightSightMode = com.example.camera.model.NightSightMode.OFF).desiredPixelExtensionMode,
         )
         assertEquals(
             com.example.camera.model.PixelExtensionMode.NIGHT,
-            multiExtState.copy(nightSightMode = com.example.camera.model.NightSightMode.ON).desiredPixelExtensionMode,
+            daylightWithPixelServicesAndBacklight.copy(nightSightMode = com.example.camera.model.NightSightMode.ON).desiredPixelExtensionMode,
         )
 
         // 3. ViewModel interaction: enabling Pixel Camera Services in Night Sight ON mode closes & locks Pro controls
@@ -1336,6 +1336,122 @@ class ExampleRobolectricTest {
         )
         assertTrue(vm.uiState.value.isBacklitDetected)
         assertTrue(vm.uiState.value.isBacklightActive)
+
+        // Well-exposed face (0.54 luma) with a blown bright window behind (18% clipped, 2% crushed)
+        // must ALSO trigger backlight detection — even when Pixel Camera Services is enabled!
+        vm.setPixelCameraServicesEnabled(true)
+        vm.updateLowLightDetection(
+            meanLuma = 0.58f,
+            crushedShadowPercent = 2f,
+            clippedHighlightPercent = 18f,
+            faceMeanLuma = 0.54f,
+        )
+        assertTrue(vm.uiState.value.isBacklitDetected)
+        assertTrue(vm.uiState.value.isBacklightActive)
+        assertEquals(com.example.camera.model.PixelExtensionMode.NONE, vm.uiState.value.desiredPixelExtensionMode)
+    }
+
+    @Test
+    fun `backlight bracket planner and pyramid exposure fusion recover blown window while keeping face crisp`() = runTest {
+        // 1. Well-exposed face + blown window plans deep negative brackets (0, -2.0, -4.0 EV)
+        val windowEvs = com.example.camera.model.LowLightDetector.planBacklightBracketEvs(
+            totalFrames = 3,
+            clippedHighlightPercent = 18f,
+            crushedShadowPercent = 2f,
+            meanLuma = 0.58f,
+            faceMeanLuma = 0.54f,
+        )
+        assertEquals(3, windowEvs.size)
+        assertEquals(0f, windowEvs[0], 0.01f)
+        assertTrue("Expected deep negative bracket <= -1.5 EV, got ${windowEvs[1]}", windowEvs[1] <= -1.5f)
+        assertTrue("Expected deeper negative bracket <= -3.5 EV, got ${windowEvs[2]}", windowEvs[2] <= -3.5f)
+
+        // 2. Dark silhouetted face + blown window plans both negative highlight & positive shadow fill
+        val silhouetteEvs = com.example.camera.model.LowLightDetector.planBacklightBracketEvs(
+            totalFrames = 3,
+            clippedHighlightPercent = 15f,
+            crushedShadowPercent = 18f,
+            meanLuma = 0.48f,
+            faceMeanLuma = 0.26f,
+        )
+        assertTrue("Expected negative bracket for window", silhouetteEvs.any { it <= -2.0f })
+        assertTrue("Expected positive bracket for dark face", silhouetteEvs.any { it >= 1.0f })
+
+        // 3. Manual shutter/ISO bracket solver shortens shutter speed even when already at min ISO
+        val (darkExpNs, darkIso) = com.example.camera.model.LowLightDetector.computeManualBracketExposure(
+            baselineIso = 50,
+            baselineExposureNs = 8_000_000L, // 1/125s at min ISO 50
+            evOffset = -3.0f,
+            isoRange = 50..6400,
+            exposureTimeRangeNs = 100_000L..1_000_000_000L,
+        )
+        assertEquals(50, darkIso)
+        assertEquals(1_000_000L, darkExpNs) // Exact 1/8x shutter (1/1000s)
+
+        // 4. Pyramid Exposure Fusion recovers blue sky through a blown white window while keeping the face natural
+        val engine = HdrPlusEngine()
+        val w = 96
+        val h = 96
+        val face = com.example.camera.model.DetectedFace(
+            id = 1, left = 0.25f, top = 0.25f, right = 0.75f, bottom = 0.75f, score = 95,
+        )
+
+        fun makePortraitWindowFrame(
+            faceRgb: Triple<Int, Int, Int>,
+            windowRgb: Triple<Int, Int, Int>,
+            evBias: Float,
+        ): com.example.camera.hardware.RawCapturedFrame.DecodedBitmap {
+            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            for (y in 0 until h) {
+                for (x in 0 until w) {
+                    val inFace = x in 24..72 && y in 24..72
+                    val (r, g, b) = if (inFace) faceRgb else windowRgb
+                    bmp.setPixel(x, y, Color.rgb(r, g, b))
+                }
+            }
+            return com.example.camera.hardware.RawCapturedFrame.DecodedBitmap(bmp, exposureBiasEv = evBias)
+        }
+
+        // 0 EV: face is well-exposed warm skin (165, 130, 110), window behind is clipped pure white (255, 255, 255)
+        val f0 = makePortraitWindowFrame(Triple(165, 130, 110), Triple(255, 255, 255), 0f)
+        // -2 EV: face is darker (78, 60, 50), window is still bright (242, 246, 255)
+        val fMinus2 = makePortraitWindowFrame(Triple(78, 60, 50), Triple(242, 246, 255), -2.0f)
+        // -4 EV: face is very dark (26, 20, 17), window shows rich blue sky (75, 138, 218)
+        val fMinus4 = makePortraitWindowFrame(Triple(26, 20, 17), Triple(75, 138, 218), -4.0f)
+
+        val fused = engine.processRawBurst(
+            rawFrames = listOf(f0, fMinus2, fMinus4),
+            mode = CameraMode.CAMERA,
+            hdrMode = HdrMode.HDR_PLUS_ENHANCED,
+            manual = ManualExposureSettings(),
+            config = HdrPipelineConfig(
+                sabreSharpening = 0f,
+                cinematicEffectEnabled = false,
+                backlightMode = BacklightMode.ON,
+            ),
+            isBacklightActive = true,
+            detectedFaces = listOf(face),
+        )
+
+        val facePixel = fused.bitmap.getPixel(48, 48)
+        val faceLuma = 0.299f * Color.red(facePixel) + 0.587f * Color.green(facePixel) + 0.114f * Color.blue(facePixel)
+        val windowPixel = fused.bitmap.getPixel(8, 8)
+        val winR = Color.red(windowPixel)
+        val winG = Color.green(windowPixel)
+        val winB = Color.blue(windowPixel)
+        val winLuma = 0.299f * winR + 0.587f * winG + 0.114f * winB
+
+        assertTrue("Expected well-exposed face to stay bright & natural (got luma=$faceLuma)", faceLuma in 110f..175f)
+        assertTrue("Expected blown white window (255) to recover cleanly below 190 (got luma=$winLuma)", winLuma < 190f)
+        assertTrue(
+            "Expected recovered window to restore blue sky color instead of clipped white (R=$winR, G=$winG, B=$winB)",
+            winB > winR + 55,
+        )
+
+        f0.release()
+        fMinus2.release()
+        fMinus4.release()
+        fused.bitmap.recycle()
     }
 
     @Test

@@ -321,16 +321,10 @@ class CameraController(private val context: Context) {
         val resolvedExtensionModeInt: Int? = if (
             pixelCameraServicesEnabled &&
             extMgr != null &&
-            requestedExtensionMode != PixelExtensionMode.NONE
+            requestedExtensionMode == PixelExtensionMode.NIGHT &&
+            PixelExtensionMode.NIGHT in supportedExtensions
         ) {
-            val candidates = when (requestedExtensionMode) {
-                PixelExtensionMode.NIGHT -> intArrayOf(ExtensionMode.NIGHT)
-                PixelExtensionMode.HDR -> intArrayOf(ExtensionMode.HDR, ExtensionMode.AUTO)
-                PixelExtensionMode.AUTO -> intArrayOf(ExtensionMode.AUTO, ExtensionMode.HDR)
-            }
-            candidates.firstOrNull { mode ->
-                mapExtensionModeInt(mode) in supportedExtensions
-            }
+            ExtensionMode.NIGHT
         } else {
             null
         }
@@ -578,12 +572,6 @@ class CameraController(private val context: Context) {
             }
 
             val modes = extensionSupportCache[lensFacing] ?: buildSet {
-                if (runCatching { mgr.isExtensionAvailable(baseFacingSelector, ExtensionMode.AUTO) }.getOrDefault(false)) {
-                    add(PixelExtensionMode.AUTO)
-                }
-                if (runCatching { mgr.isExtensionAvailable(baseFacingSelector, ExtensionMode.HDR) }.getOrDefault(false)) {
-                    add(PixelExtensionMode.HDR)
-                }
                 if (runCatching { mgr.isExtensionAvailable(baseFacingSelector, ExtensionMode.NIGHT) }.getOrDefault(false)) {
                     add(PixelExtensionMode.NIGHT)
                 }
@@ -607,8 +595,6 @@ class CameraController(private val context: Context) {
     }
 
     private fun mapExtensionModeInt(mode: Int?): PixelExtensionMode = when (mode) {
-        ExtensionMode.AUTO -> PixelExtensionMode.AUTO
-        ExtensionMode.HDR -> PixelExtensionMode.HDR
         ExtensionMode.NIGHT -> PixelExtensionMode.NIGHT
         else -> PixelExtensionMode.NONE
     }
@@ -1487,6 +1473,10 @@ class CameraController(private val context: Context) {
         manualSettings: ManualExposureSettings,
         mirrorFrontCamera: Boolean,
         isBacklit: Boolean = false,
+        clippedHighlightPercent: Float = 0f,
+        crushedShadowPercent: Float = 0f,
+        meanLuma: Float = 0.5f,
+        faceMeanLuma: Float? = null,
         previewView: PreviewView? = null,
         isAeAfLocked: Boolean = false,
         onFrameCaptured: (captured: Int, total: Int) -> Unit,
@@ -1503,28 +1493,44 @@ class CameraController(private val context: Context) {
                 isAeAfLocked = isAeAfLocked,
             )
 
-            val totalFrames = when (hdrMode) {
+            val baseTotalFrames = when (hdrMode) {
                 HdrMode.OFF -> 1
                 HdrMode.HDR_PLUS -> 2
                 HdrMode.HDR_PLUS_ENHANCED -> requestedFrameCount.coerceIn(2, 5)
             }
+            // In backlit scenes, ensure at least 3 frames so pyramid exposure fusion gets both
+            // the 0 EV face anchor and deep negative (-2/-4 EV) highlight brackets (or +EV fill).
+            val totalFrames = if (isBacklit && hdrMode != HdrMode.OFF && !manualSettings.isManualExposureActive) {
+                maxOf(baseTotalFrames, 3)
+            } else {
+                baseTotalFrames
+            }
 
-            // Use real exposure bracketing in strongly backlit scenes so shadowed subjects receive
-            // real sensor photons (+1.5 EV) instead of stretching noisy 8-bit shadows!
-            val canBracket = isBacklit &&
+            val (baselineIso, baselineExpNs) = getManualBaselineExposure(
+                lowLightBoostWasActive = lowLightBoostEnabled,
+            )
+            val canManualBracket = isBacklit &&
+                totalFrames >= 2 &&
+                hdrMode != HdrMode.OFF &&
+                !manualSettings.isManualExposureActive &&
+                caps.manualSensorSupported &&
+                baselineIso != null &&
+                baselineExpNs != null
+            val canEvBracket = isBacklit &&
                 totalFrames >= 2 &&
                 hdrMode != HdrMode.OFF &&
                 !manualSettings.isManualExposureActive &&
                 (caps.maxEvIndex - caps.minEvIndex) >= 4
+            val canBracket = canManualBracket || canEvBracket
+
             val evOffsets: FloatArray = if (canBracket) {
-                FloatArray(totalFrames) { idx ->
-                    when (idx) {
-                        0 -> 0f
-                        1 -> 1.5f
-                        2 -> -1.0f
-                        else -> 0f
-                    }
-                }
+                LowLightDetector.planBacklightBracketEvs(
+                    totalFrames = totalFrames,
+                    clippedHighlightPercent = clippedHighlightPercent,
+                    crushedShadowPercent = crushedShadowPercent,
+                    meanLuma = meanLuma,
+                    faceMeanLuma = faceMeanLuma,
+                )
             } else {
                 FloatArray(totalFrames) { 0f }
             }
@@ -1533,7 +1539,7 @@ class CameraController(private val context: Context) {
                 .coerceIn(caps.minEvIndex, caps.maxEvIndex)
 
             // Disable heavy single-frame ISP smoothing during multi-frame bursts to prevent double-denoising ("soap")
-            val appliedBurstNrOverride = if (totalFrames > 1 && !hasActiveCamera2Overrides) {
+            var appliedBurstCamera2Override = if (totalFrames > 1 && !hasActiveCamera2Overrides) {
                 applyMultiFrameBurstQualityOptions(camera, caps)
             } else {
                 false
@@ -1545,17 +1551,72 @@ class CameraController(private val context: Context) {
 
             try {
                 for (idx in 0 until totalFrames) {
-                    val evDelta = evOffsets[idx]
-                    if (canBracket) {
-                        val targetIdx = ((manualSettings.exposureCompensationEv + evDelta) / caps.evStep)
+                    val requestedEvDelta = evOffsets[idx]
+                    var actualEvDelta = requestedEvDelta
+
+                    if (canManualBracket && kotlin.math.abs(requestedEvDelta) >= 0.25f) {
+                        val (targetExpNs, targetIso) = LowLightDetector.computeManualBracketExposure(
+                            baselineIso = baselineIso!!,
+                            baselineExposureNs = baselineExpNs!!,
+                            evOffset = requestedEvDelta,
+                            isoRange = caps.isoRange,
+                            exposureTimeRangeNs = caps.exposureTimeRangeNs,
+                        )
+                        val applied = applyManualBracketExposureRequest(
+                            camera = camera,
+                            caps = caps,
+                            manualSettings = manualSettings,
+                            targetExposureNs = targetExpNs,
+                            targetIso = targetIso,
+                        )
+                        if (applied) {
+                            appliedBurstCamera2Override = true
+                            val seqAfterApply = previewResultSeq.get()
+                            waitForBracketExposureSettle(
+                                targetExposureNs = targetExpNs,
+                                targetIso = targetIso,
+                                minResultSeq = seqAfterApply,
+                            )
+                        } else if (canEvBracket) {
+                            val targetIdx = ((manualSettings.exposureCompensationEv + requestedEvDelta) / caps.evStep)
+                                .roundToInt()
+                                .coerceIn(caps.minEvIndex, caps.maxEvIndex)
+                            actualEvDelta = (targetIdx - baseEvIndex) * caps.evStep
+                            if (targetIdx != lastAppliedEvIndex) {
+                                lastAppliedEvIndex = targetIdx
+                                runCatching { camera.cameraControl.setExposureCompensationIndex(targetIdx) }
+                                delay(210L)
+                            }
+                        }
+                    } else if (canEvBracket && !canManualBracket) {
+                        val targetIdx = ((manualSettings.exposureCompensationEv + requestedEvDelta) / caps.evStep)
                             .roundToInt()
                             .coerceIn(caps.minEvIndex, caps.maxEvIndex)
+                        actualEvDelta = (targetIdx - baseEvIndex) * caps.evStep
                         if (targetIdx != lastAppliedEvIndex) {
                             lastAppliedEvIndex = targetIdx
                             runCatching { camera.cameraControl.setExposureCompensationIndex(targetIdx) }
-                            delay(150L)
+                            delay(if (kotlin.math.abs(requestedEvDelta) >= 1.5f) 210L else 150L)
+                        }
+                    } else if (canManualBracket && appliedBurstCamera2Override && idx > 0 && kotlin.math.abs(requestedEvDelta) < 0.25f) {
+                        // Return to metered 0 EV manual baseline for any trailing 0 EV SNR frame
+                        val applied = applyManualBracketExposureRequest(
+                            camera = camera,
+                            caps = caps,
+                            manualSettings = manualSettings,
+                            targetExposureNs = baselineExpNs!!,
+                            targetIso = baselineIso!!,
+                        )
+                        if (applied) {
+                            val seqAfterApply = previewResultSeq.get()
+                            waitForBracketExposureSettle(
+                                targetExposureNs = baselineExpNs,
+                                targetIso = baselineIso,
+                                minResultSeq = seqAfterApply,
+                            )
                         }
                     }
+
                     val imageProxy = takeSingleImageProxy(imageCapture)
                     // Extract compact JPEG bytes and close ImageProxy IMMEDIATELY before requesting
                     // the next frame so CameraX's internal ImageReader buffer never exhausts or stalls.
@@ -1564,7 +1625,7 @@ class CameraController(private val context: Context) {
                             image = imageProxy,
                             mirrorHorizontally = mirror,
                             maxLongEdge = MAX_CAPTURE_LONG_EDGE,
-                            exposureBiasEv = evDelta,
+                            exposureBiasEv = actualEvDelta,
                         )
                     }
                     rawFrames.add(frame)
@@ -1575,15 +1636,16 @@ class CameraController(private val context: Context) {
                 rawFrames.forEach { it.release() }
                 throw t
             } finally {
-                if (canBracket && lastAppliedEvIndex != baseEvIndex) {
+                if (canEvBracket && lastAppliedEvIndex != baseEvIndex) {
                     lastAppliedEvIndex = baseEvIndex
                     runCatching { camera.cameraControl.setExposureCompensationIndex(baseEvIndex) }
                 }
-                if (appliedBurstNrOverride) {
+                if (appliedBurstCamera2Override) {
                     runCatching {
                         Camera2CameraControl.from(camera.cameraControl).clearCaptureRequestOptions()
                         hasActiveCamera2Overrides = false
                     }
+                    lastAppliedEvIndex = null
                     applyManualSettings(manualSettings)
                 }
                 // Immediately release any temporary tap-focus lock after capture so continuous AF resumes
@@ -1591,6 +1653,94 @@ class CameraController(private val context: Context) {
                     cancelFocusLock()
                 }
             }
+        }
+    }
+
+    @OptIn(ExperimentalCamera2Interop::class)
+    private suspend fun applyManualBracketExposureRequest(
+        camera: Camera,
+        caps: HardwareCapabilities,
+        manualSettings: ManualExposureSettings,
+        targetExposureNs: Long,
+        targetIso: Int,
+    ): Boolean = runCatching {
+        val c2Control = Camera2CameraControl.from(camera.cameraControl)
+        val nrMode = if (caps.minimalNoiseReductionSupported) {
+            CameraMetadata.NOISE_REDUCTION_MODE_MINIMAL
+        } else {
+            CameraMetadata.NOISE_REDUCTION_MODE_FAST
+        }
+        val builder = CaptureRequestOptions.Builder()
+            .setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+            .setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, targetExposureNs)
+            .setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, targetIso)
+            .setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, nrMode)
+            .setCaptureRequestOption(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_FAST)
+
+        if (caps.postRawBoostSupported) {
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_POST_RAW_SENSITIVITY_BOOST, 100)
+        }
+        if (caps.oisSupported) {
+            builder.setCaptureRequestOption(
+                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON,
+            )
+        }
+        manualSettings.focusDistanceDiopter?.let { diopter ->
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+            builder.setCaptureRequestOption(
+                CaptureRequest.LENS_FOCUS_DISTANCE,
+                diopter.coerceIn(0f, caps.minFocusDiopter),
+            )
+        }
+        if (manualSettings.whiteBalanceKelvin != null) {
+            val (r, g, b) = KelvinColorMath.kelvinToRgbGains(manualSettings.whiteBalanceKelvin)
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
+            builder.setCaptureRequestOption(
+                CaptureRequest.COLOR_CORRECTION_MODE,
+                CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX,
+            )
+            builder.setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(r, g, g, b))
+        } else {
+            // Lock AWB across exposure brackets so outdoor window highlights keep consistent color temperature
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, true)
+        }
+
+        val future = c2Control.setCaptureRequestOptions(builder.build())
+        hasActiveCamera2Overrides = true
+        withTimeoutOrNull(220L) {
+            suspendCancellableCoroutine<Unit> { cont ->
+                future.addListener(
+                    { if (cont.isActive) cont.resume(Unit) },
+                    ContextCompat.getMainExecutor(context),
+                )
+            }
+        }
+        true
+    }.getOrElse { err ->
+        Log.w("CameraController", "Manual backlight bracket override fallback", err)
+        false
+    }
+
+    private suspend fun waitForBracketExposureSettle(
+        targetExposureNs: Long,
+        targetIso: Int,
+        minResultSeq: Long,
+    ) {
+        val deadline = System.currentTimeMillis() + 240L
+        val expTol = (targetExposureNs * 0.25f).toLong().coerceAtLeast(300_000L)
+        val isoTol = (targetIso * 0.25f).roundToInt().coerceAtLeast(15)
+        while (System.currentTimeMillis() < deadline) {
+            val hasFresh = previewResultSeq.get() > minResultSeq
+            val aeOk = lastAeMode == null || lastAeMode == CameraMetadata.CONTROL_AE_MODE_OFF
+            val liveExp = lastExposureTimeNs
+            val liveIso = lastSensorIso
+            val expOk = liveExp != null && kotlin.math.abs(liveExp - targetExposureNs) <= expTol
+            val isoOk = liveIso != null && kotlin.math.abs(liveIso - targetIso) <= isoTol
+            if (hasFresh && aeOk && expOk && isoOk) {
+                return
+            }
+            delay(15L)
         }
     }
 

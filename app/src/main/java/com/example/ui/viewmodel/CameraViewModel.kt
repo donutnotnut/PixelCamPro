@@ -139,14 +139,12 @@ data class CameraUiState(
         get() = tonePresets.firstOrNull { it.id == activePresetId }
 
     /**
-     * True when the active lens supports Pixel Camera Services ONLY for Night Sight
-     * (for example, stock Pixel 9/10 where Google exposes ExtensionMode.NIGHT but not HDR/AUTO).
+     * True when Pixel Camera Services Night Sight extension is supported on this lens.
+     * Pixel Camera Services is used exclusively for Night Sight; all daylight, HDR+,
+     * Backlight, and Ultra HDR modes always run on the custom computational pipeline.
      */
     val isPixelNightOnlyDevice: Boolean
-        get() = hasCheckedPixelExtensions &&
-            PixelExtensionMode.NIGHT in supportedPixelExtensions &&
-            PixelExtensionMode.HDR !in supportedPixelExtensions &&
-            PixelExtensionMode.AUTO !in supportedPixelExtensions
+        get() = hasCheckedPixelExtensions && PixelExtensionMode.NIGHT in supportedPixelExtensions
 
     /** True when Auto Night Sight wants Night mode right now (low light detected, flash not forced, auto exposure). */
     val isAutoNightSightTriggered: Boolean
@@ -156,41 +154,20 @@ data class CameraUiState(
             !manualSettings.isManualExposureActive
 
     /**
-     * Target CameraX Extensions mode derived from the user's Pixel Camera Services switch,
-     * discovered lens capabilities, and Night Sight / HDR+ mode selection.
-     *
-     * On Night-only devices (e.g. stock Pixel 10), daylight stays on the custom HDR+ engine
-     * + optional native Ultra HDR (OUTPUT_FORMAT_JPEG_ULTRA_HDR), and Pixel Night Sight engages
-     * automatically when Night Sight is ON or Auto Night Sight detects low light.
+     * Target CameraX Extensions mode: Pixel Camera Services is strictly limited to Night Sight.
+     * Daylight, HDR+, Backlight, and Ultra HDR ALWAYS run on the custom pipeline even while
+     * Pixel Camera Services is enabled in settings.
      */
     val desiredPixelExtensionMode: PixelExtensionMode
         get() = when {
             !pixelCameraServicesEnabled -> PixelExtensionMode.NONE
-            nightSightMode == NightSightMode.ON -> {
+            nightSightMode == NightSightMode.ON || isAutoNightSightTriggered -> {
                 if (!hasCheckedPixelExtensions || PixelExtensionMode.NIGHT in supportedPixelExtensions) {
                     PixelExtensionMode.NIGHT
                 } else {
                     PixelExtensionMode.NONE
                 }
             }
-            isPixelNightOnlyDevice -> {
-                if (isAutoNightSightTriggered) PixelExtensionMode.NIGHT else PixelExtensionMode.NONE
-            }
-            !hasCheckedPixelExtensions -> {
-                // Before capability probe completes, only request NIGHT if Auto Night Sight is already triggered;
-                // otherwise bind standard session first so capabilities are probed off the main thread without forcing Night in daylight.
-                if (isAutoNightSightTriggered) PixelExtensionMode.NIGHT else PixelExtensionMode.NONE
-            }
-            nightSightMode == NightSightMode.AUTO -> {
-                when {
-                    isAutoNightSightTriggered && PixelExtensionMode.NIGHT in supportedPixelExtensions -> PixelExtensionMode.NIGHT
-                    PixelExtensionMode.AUTO in supportedPixelExtensions -> PixelExtensionMode.AUTO
-                    hdrMode != HdrMode.OFF && PixelExtensionMode.HDR in supportedPixelExtensions -> PixelExtensionMode.HDR
-                    else -> PixelExtensionMode.NONE
-                }
-            }
-            hdrMode != HdrMode.OFF && PixelExtensionMode.HDR in supportedPixelExtensions -> PixelExtensionMode.HDR
-            PixelExtensionMode.AUTO in supportedPixelExtensions -> PixelExtensionMode.AUTO
             else -> PixelExtensionMode.NONE
         }
 
@@ -665,9 +642,6 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     },
                 )
                 val extActive = caps.activeExtensionMode != PixelExtensionMode.NONE
-                val isNightOnly = PixelExtensionMode.NIGHT in caps.supportedPixelExtensions &&
-                    PixelExtensionMode.HDR !in caps.supportedPixelExtensions &&
-                    PixelExtensionMode.AUTO !in caps.supportedPixelExtensions
                 if (extActive && caps.activeExtensionMode == PixelExtensionMode.NIGHT) {
                     autoPixelNightEntryLux = null
                     latestAmbientLux = null
@@ -717,16 +691,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         )
                     )
                 }
-                if (state.pixelCameraServicesEnabled && !extActive) {
-                    when {
-                        !caps.pixelExtensionsSupported -> {
-                            showBanner("Pixel Camera Services unavailable on this lens — using custom engine")
-                        }
-                        isNightOnly && !hasShownNightOnlyNotice -> {
-                            hasShownNightOnlyNotice = true
-                            showBanner("Pixel Camera Services on this device supports Night Sight only")
-                        }
-                    }
+                if (state.pixelCameraServicesEnabled && !extActive && !caps.pixelExtensionsSupported && !hasShownNightOnlyNotice) {
+                    hasShownNightOnlyNotice = true
+                    showBanner("Pixel Night Sight unavailable on this lens — using custom Night Sight")
                 }
                 cameraController.setZoomRatio(state.currentZoomRatio)
                 if (!extActive) {
@@ -834,16 +801,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
         if (enabled) {
             hasShownNightOnlyNotice = false
-            val willEnterExtensionNow = when {
-                current.nightSightMode == NightSightMode.ON ->
-                    !current.hasCheckedPixelExtensions || PixelExtensionMode.NIGHT in current.supportedPixelExtensions
-                current.isPixelNightOnlyDevice -> current.isAutoNightSightTriggered
-                current.hasCheckedPixelExtensions ->
-                    PixelExtensionMode.AUTO in current.supportedPixelExtensions ||
-                        (current.hdrMode != HdrMode.OFF && PixelExtensionMode.HDR in current.supportedPixelExtensions) ||
-                        (current.isAutoNightSightTriggered && PixelExtensionMode.NIGHT in current.supportedPixelExtensions)
-                else -> current.isAutoNightSightTriggered
-            }
+            val nightSupportedOrUnknown = !current.hasCheckedPixelExtensions ||
+                PixelExtensionMode.NIGHT in current.supportedPixelExtensions
+            val willEnterExtensionNow = nightSupportedOrUnknown &&
+                (current.nightSightMode == NightSightMode.ON || current.isAutoNightSightTriggered)
             val sanitizedManual = if (willEnterExtensionNow) {
                 current.manualSettings.copy(
                     iso = null,
@@ -870,18 +831,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             }
             persistPrefs { it.copy(pixelCameraServicesEnabled = true) }
             when {
-                current.isPixelNightOnlyDevice && !willEnterExtensionNow -> {
-                    hasShownNightOnlyNotice = true
-                    showBanner("Pixel Camera Services on this device supports Night Sight only")
-                }
                 current.hasCheckedPixelExtensions && !current.pixelExtensionsSupported -> {
-                    showBanner("Pixel Camera Services unavailable on this lens — using custom engine")
+                    showBanner("Pixel Night Sight unavailable on this lens — using custom engine")
                 }
                 willEnterExtensionNow -> {
-                    showBanner("Pixel Camera Services active — Pro & custom HDR+ locked")
+                    showBanner("Pixel Night Sight active — Pro & custom HDR+ locked")
                 }
                 else -> {
-                    showBanner("Pixel Camera Services enabled")
+                    showBanner("Pixel Night Sight enabled • Daylight & Backlight use custom HDR+")
                 }
             }
         } else {
@@ -1681,6 +1638,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         manualSettings = snapshot.manualSettings,
                         mirrorFrontCamera = effectiveHdrConfig.mirrorFrontCamera,
                         isBacklit = snapshot.isBacklightActive,
+                        clippedHighlightPercent = latestAnalysis.clippedHighlightPercent,
+                        crushedShadowPercent = latestAnalysis.crushedShadowPercent,
+                        meanLuma = latestLuma,
+                        faceMeanLuma = latestAnalysis.faceMeanLuma,
                         previewView = activePreviewViewRef?.get(),
                         isAeAfLocked = snapshot.focusReticle?.isAeAfLocked == true,
                         onFrameCaptured = { count, total ->

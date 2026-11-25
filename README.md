@@ -15,8 +15,8 @@
 - **Edge-Preserving Temporal Merge & Chroma Denoise**: Precomputed LUT-accelerated temporal stacking boosts signal-to-noise ratio in shadows while suppressing color noise.
 - **Halo-Free Local Tone Mapping**: Bilinearly interpolated multi-pass Gaussian local tone mapping avoids tile seams and dark halos around bright specular highlights.
 - **Sabre Deconvolution & Face / Motion Deblur**: Directional micro-blur estimation and deconvolution restore fine edge sharpness across both standard and backlit portraits while skipping already-sharp frames.
-- **Backlight Picture Mode (`Auto` / `On` / `Off`)**: Detects high-contrast backlit scenes and underexposed faces against bright backgrounds, applying exposure bracket fusion, anti-flare dehazing, and shadow clarity.
-- **10-bit Ultra HDR (Android 14+ / API 34+)**: Captures native hardware Ultra HDR when supported or synthesizes a 10-bit `Gainmap`, preserving intact MPF/GContainer metadata when saved to `DCIM/Camera`.
+- **Backlight Picture Mode (`Auto` / `On` / `Off`)**: Detects split high-contrast scenes, dark backlit faces, and well-exposed faces against blown bright windows/skies. Fires fast adaptive **manual shutter/ISO exposure brackets** (e.g., `0 EV`, `-2.0 EV`, `-4.0 EV` for bright windows, or `+1.5 EV` shadow fill for silhouettes) via Camera2 `CONTROL_AE_MODE_OFF` and blends them with memory-bounded **6-level Laplacian Pyramid Exposure Fusion** — replacing clipped backgrounds seamlessly while keeping faces crisp and ghost-free, paired with anti-flare dehazing and shadow clarity.
+- **10-bit Ultra HDR (Android 14+ / API 34+)**: Captures native hardware Ultra HDR when supported or synthesizes a 10-bit `Gainmap` (synthesizing directly from fused output on bracketed backlit shots), preserving intact MPF/GContainer metadata when saved to `DCIM/Camera`.
 - **Cinematic Effect**: Optional out-of-the-box filmic tuning (subtle deeper exposure, richer contrast, and vibrant color) that stays synchronized between live preview and final saved output.
 - **Advanced Pipeline Tuning**: Fine-tune highlight recovery, local tone mapping, temporal shadow denoise, Sabre deconvolution sharpening, backlight anti-flare dehaze, backlight shadow clarity, and motion/face deblur strength directly from Settings.
 
@@ -25,9 +25,9 @@
 - **Exposure-Equivalence Long Exposure**: Automatically plans **3–5 handheld long-exposure frames** (100–280 ms per frame) that extend shutter speed while lowering ISO to cut noise and protect bright light sources from clipping.
 - **Live Hold Feedback & Smart Handoff**: Displays a 360° circular shutter hold progress indicator during capture, automatically manages HDR/Ultra HDR state while in low light, and monitors the ambient light sensor (lux) to exit smoothly when returning to daylight.
 
-### Pixel Camera Services (CameraX Extensions)
-- **Native Vendor Extensions Toggle**: Optionally enable Google's native **Pixel Camera Services** (`Auto`, `HDR`, `Night` via `androidx.camera:camera-extensions`).
-- **Hybrid Night-Only Routing**: On devices that expose only Pixel Night Sight via extensions, daylight captures stay on PixelCam Pro's custom HDR+ & Native Ultra HDR pipeline while low-light scenes automatically switch to native Pixel Night Sight.
+### Pixel Camera Services (Night Sight Extension)
+- **Night-Sight-Only Vendor Extension**: Optionally enable Google's native **Pixel Night Sight** (`ExtensionMode.NIGHT` via `androidx.camera:camera-extensions`) for low-light captures.
+- **Custom Pipeline Everywhere Else**: Even when Pixel Camera Services is turned on, all non-Night-Sight modes — daylight HDR+, multi-exposure Backlight fusion, Ultra HDR, Face/Motion Deblur, live histogram HUD, and Pro controls — always run on PixelCam Pro's custom computational pipeline, seamlessly switching to Pixel Night Sight only when Night Sight activates.
 
 ### Live Viewfinder, GPU Grading & Framing HUD
 - **Real-Time AGSL Shader Preview (Android 13+)**: Uses a branch-light FP16 AGSL `RuntimeShader` for non-linear Shadows and Highlights curves, and zero-FBO hardware layer `ColorMatrix` grading for Contrast, Vibrancy, EV, Cinematic look, and White Balance (with automatic Android 12 and below fallback).
@@ -76,12 +76,12 @@ app/src/main/java/com/example/
 ├── MainActivity.kt                        # Edge-to-edge host activity & max refresh rate setup
 ├── camera/
 │   ├── hardware/
-│   │   ├── CameraController.kt            # CameraX + Camera2 interop, Extensions, bursts, AF/AE, face detection
+│   │   ├── CameraController.kt            # CameraX + Camera2 interop, Night extension, manual shutter/ISO brackets, AF/AE, face detection
 │   │   └── HorizonSensorMonitor.kt        # Gravity/accelerometer spirit level & ambient lux sensor flows
 │   ├── model/
-│   │   └── CameraModels.kt                # Domain models, AGSL shader, ColorMatrix/Kelvin math, LowLightDetector, FaceCoordinateMapper
+│   │   └── CameraModels.kt                # Domain models, AGSL shader, ColorMatrix/Kelvin math, LowLightDetector, Backlight bracket planner, FaceCoordinateMapper
 │   └── processing/
-│       ├── HdrPlusEngine.kt               # Multi-core HDR+ burst alignment, merge, tone mapping, deblur & Ultra HDR gainmap
+│       ├── HdrPlusEngine.kt               # Multi-core HDR+ alignment, Laplacian pyramid exposure fusion, merge, tone mapping, deblur & Ultra HDR gainmap
 │       ├── LiveFrameAnalyzer.kt           # Throttled YUV_420_888 32-bin RGB+Luma histogram, sharpness & face-ROI luma
 │       └── MediaStoreRepository.kt        # DCIM/Camera JPEG/Ultra HDR/DNG storage, EXIF tagging & MediaStore queries
 ├── data/
@@ -157,7 +157,7 @@ app/src/main/java/com/example/
 
 The project includes comprehensive unit and Robolectric test suites covering computational imaging math, multi-frame burst processing, low-light planning, face coordinate transforms, and `CameraViewModel` state logic:
 
-- [`ExampleRobolectricTest.kt`](app/src/test/java/com/example/ExampleRobolectricTest.kt) — HDR+ burst merging, tile alignment, halo-free tone curves, motion-blur rejection, Sabre sharpening, Ultra HDR gainmaps, Cinematic grading, Night Sight exposure equivalence, Backlight fusion, Pixel Camera Services routing, Tone Presets, and motion deblurring.
+- [`ExampleRobolectricTest.kt`](app/src/test/java/com/example/ExampleRobolectricTest.kt) — HDR+ burst merging, tile alignment, halo-free tone curves, motion-blur rejection, Sabre sharpening, Ultra HDR gainmaps, Cinematic grading, Night Sight exposure equivalence, adaptive Backlight detection & shutter/ISO bracketing, Laplacian pyramid exposure fusion, Night-only Pixel Camera Services routing, Tone Presets, and motion deblurring.
 - [`FaceAndNightSightTest.kt`](app/src/test/java/com/example/FaceAndNightSightTest.kt) — Face coordinate zoom/rotation mapping, handheld Night Sight planner bounds, Pixel Post-RAW ISO damping, highlight protection, and selective face deblurring.
 
 Run all local unit and Robolectric tests with:

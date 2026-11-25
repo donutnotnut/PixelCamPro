@@ -111,7 +111,10 @@ class HdrPlusEngine {
             val width: Int
             val height: Int
             val mergedPixels: IntArray
-            val wantNativeGainmap = !nightSightEnabled && config.ultraHdrEnabled && hdrMode != HdrMode.OFF
+            val hasExposureBrackets = !nightSightEnabled && rawFrames.any { abs(it.exposureBiasEv) >= 0.35f }
+            // When fusing multi-exposure brackets, synthesize the Ultra HDR gainmap from the fused
+            // pixels rather than cloning the clipped 0 EV single-frame gainmap.
+            val wantNativeGainmap = !nightSightEnabled && !hasExposureBrackets && config.ultraHdrEnabled && hdrMode != HdrMode.OFF
             var nativeGainmap: Gainmap? = null
             try {
                 val scaled = downscaleIfNeeded(refBmp, MAX_PROCESS_LONG_EDGE)
@@ -131,7 +134,17 @@ class HdrPlusEngine {
             }
 
             try {
-                val (alignmentConfidence, effectiveFramesMerged) = if (hdrMode != HdrMode.OFF || nightSightEnabled) {
+                val (alignmentConfidence, effectiveFramesMerged) = if (hasExposureBrackets && hdrMode != HdrMode.OFF) {
+                    fuseExposureBracketsStreaming(
+                        mergedPixels = mergedPixels,
+                        rawFrames = rawFrames,
+                        refIndex = refIndex,
+                        width = width,
+                        height = height,
+                        config = config,
+                        detectedFaces = activeFaces,
+                    )
+                } else if (hdrMode != HdrMode.OFF || nightSightEnabled) {
                     mergeRawFramesStreaming(
                         mergedPixels = mergedPixels,
                         rawFrames = rawFrames,
@@ -311,7 +324,23 @@ class HdrPlusEngine {
         // Release reference from list wrapper; secondary frames are cleared inside mergeFramesInPlace
         refFrame.pixels = null
 
-        val (alignmentConfidence, effectiveFramesMerged) = if (!isPixelExtensionCapture &&
+        val hasExposureBrackets = !isPixelExtensionCapture &&
+            !nightSightEnabled &&
+            hdrMode != HdrMode.OFF &&
+            extracted.size > 1 &&
+            extracted.any { abs(it.exposureBiasEv) >= 0.35f }
+
+        val (alignmentConfidence, effectiveFramesMerged) = if (hasExposureBrackets) {
+            fuseExposureBracketsInPlace(
+                mergedPixels = mergedPixels,
+                extracted = extracted,
+                refIndex = refIndex,
+                width = width,
+                height = height,
+                config = config,
+                detectedFaces = detectedFaces,
+            )
+        } else if (!isPixelExtensionCapture &&
             extracted.size > 1 &&
             (hdrMode != HdrMode.OFF || nightSightEnabled)
         ) {
@@ -938,6 +967,834 @@ class HdrPlusEngine {
             ),
             lumaHistogram = histogramBins,
         )
+    }
+
+    /**
+     * Multi-scale Laplacian Pyramid Exposure Fusion (Mertens-style, streaming & memory-bounded)
+     * for backlit multi-exposure bursts (e.g. 0 EV face anchor + -2/-4 EV highlight brackets + +1.5 EV shadow fill):
+     * - Aligns each bracket frame to the 0 EV reference (ignoring clipped pixels during alignment).
+     * - Computes per-pixel well-exposedness + saturation weights with clip suppression near 255,
+     *   highlight/shadow role gating, and feathered face ghosting protection so well-exposed faces
+     *   stay 100% crisp from the 0 EV frame while blown windows come cleanly from the dark frames.
+     * - Streams frames one-by-one into a 5–6 level Laplacian pyramid (ShortArray L0 + FloatArray L1..5)
+     *   so peak RAM stays bounded even at 12.5MP with zero cutout seams or halos around hair/windows.
+     */
+    private suspend fun fuseExposureBracketsStreaming(
+        mergedPixels: IntArray,
+        rawFrames: List<RawCapturedFrame>,
+        refIndex: Int,
+        width: Int,
+        height: Int,
+        config: HdrPipelineConfig,
+        detectedFaces: List<DetectedFace> = emptyList(),
+    ): Pair<Float, Int> {
+        val totalPixels = width * height
+        val refLumaPlane = FloatArray(totalPixels)
+        val refIsEdge = BooleanArray(totalPixels)
+        extractRefLumaAndEdges(mergedPixels, width, height, refLumaPlane, refIsEdge)
+
+        val coarseW = 160
+        val coarseH = 120
+        val refThumb = createLumaThumbnailFromPlane(refLumaPlane, width, height, coarseW, coarseH)
+        val refMeanLuma = meanOfArray(refThumb).coerceAtLeast(8f)
+        val faceBounds = buildFacePixelBounds(detectedFaces, width, height, padFraction = 0.14f)
+
+        val fusion = PyramidExposureFusion(width, height)
+        fusion.accumulateFrame(
+            pixels = mergedPixels,
+            exposureBiasEv = rawFrames[refIndex].exposureBiasEv,
+            isReference = true,
+            refLumaPlane = refLumaPlane,
+            refIsEdge = refIsEdge,
+            faceBounds = faceBounds,
+            globalDx = 0,
+            globalDy = 0,
+            tileShifts = null,
+            tileCols = 8,
+            tileRows = 6,
+        )
+
+        var confSum = 0f
+        var alignedCount = 0
+        var effectiveFramesMerged = 1
+
+        for (fIdx in rawFrames.indices) {
+            if (fIdx == refIndex) continue
+            val raw = rawFrames[fIdx]
+            val ownsBmp = raw !is RawCapturedFrame.DecodedBitmap
+            val bmp = CameraController.decodeRawFrame(raw, maxLongEdge = MAX_PROCESS_LONG_EDGE)
+            var otherPixels: IntArray? = null
+            try {
+                val scaled = downscaleIfNeeded(bmp, MAX_PROCESS_LONG_EDGE)
+                try {
+                    if (scaled.width == width && scaled.height == height) {
+                        otherPixels = IntArray(totalPixels).also {
+                            scaled.getPixels(it, 0, width, 0, 0, width, height)
+                        }
+                    }
+                } finally {
+                    if (scaled !== bmp && !scaled.isRecycled) scaled.recycle()
+                }
+            } finally {
+                if (ownsBmp && !bmp.isRecycled) bmp.recycle()
+            }
+
+            val pixels = otherPixels ?: continue
+            val aligned = alignFrameForFusion(
+                otherPixels = pixels,
+                otherExposureBiasEv = raw.exposureBiasEv,
+                refLumaPlane = refLumaPlane,
+                refThumb = refThumb,
+                refMeanLuma = refMeanLuma,
+                width = width,
+                height = height,
+                coarseW = coarseW,
+                coarseH = coarseH,
+                config = config,
+            ) ?: continue
+
+            fusion.accumulateFrame(
+                pixels = pixels,
+                exposureBiasEv = raw.exposureBiasEv,
+                isReference = false,
+                refLumaPlane = refLumaPlane,
+                refIsEdge = refIsEdge,
+                faceBounds = faceBounds,
+                globalDx = aligned.globalDx,
+                globalDy = aligned.globalDy,
+                tileShifts = aligned.tileShifts,
+                tileCols = aligned.tileCols,
+                tileRows = aligned.tileRows,
+            )
+            confSum += aligned.confidence
+            alignedCount++
+            effectiveFramesMerged++
+        }
+
+        fusion.collapseToPixels(mergedPixels)
+        val alignmentConfidence = if (alignedCount > 0) {
+            (confSum / alignedCount).coerceIn(0.45f, 0.99f)
+        } else {
+            1.0f
+        }
+        return alignmentConfidence to effectiveFramesMerged
+    }
+
+    private suspend fun fuseExposureBracketsInPlace(
+        mergedPixels: IntArray,
+        extracted: MutableList<ExtractedFrame>,
+        refIndex: Int,
+        width: Int,
+        height: Int,
+        config: HdrPipelineConfig,
+        detectedFaces: List<DetectedFace> = emptyList(),
+    ): Pair<Float, Int> {
+        val totalPixels = width * height
+        val refLumaPlane = FloatArray(totalPixels)
+        val refIsEdge = BooleanArray(totalPixels)
+        extractRefLumaAndEdges(mergedPixels, width, height, refLumaPlane, refIsEdge)
+
+        val coarseW = 160
+        val coarseH = 120
+        val refThumb = createLumaThumbnailFromPlane(refLumaPlane, width, height, coarseW, coarseH)
+        val refMeanLuma = meanOfArray(refThumb).coerceAtLeast(8f)
+        val faceBounds = buildFacePixelBounds(detectedFaces, width, height, padFraction = 0.14f)
+
+        val fusion = PyramidExposureFusion(width, height)
+        fusion.accumulateFrame(
+            pixels = mergedPixels,
+            exposureBiasEv = extracted[refIndex].exposureBiasEv,
+            isReference = true,
+            refLumaPlane = refLumaPlane,
+            refIsEdge = refIsEdge,
+            faceBounds = faceBounds,
+            globalDx = 0,
+            globalDy = 0,
+            tileShifts = null,
+            tileCols = 8,
+            tileRows = 6,
+        )
+
+        var confSum = 0f
+        var alignedCount = 0
+        var effectiveFramesMerged = 1
+
+        for (fIdx in extracted.indices) {
+            if (fIdx == refIndex) continue
+            val frame = extracted[fIdx]
+            val otherPixels = frame.pixels
+            frame.pixels = null
+            if (otherPixels == null || frame.width != width || frame.height != height) continue
+
+            val aligned = alignFrameForFusion(
+                otherPixels = otherPixels,
+                otherExposureBiasEv = frame.exposureBiasEv,
+                refLumaPlane = refLumaPlane,
+                refThumb = refThumb,
+                refMeanLuma = refMeanLuma,
+                width = width,
+                height = height,
+                coarseW = coarseW,
+                coarseH = coarseH,
+                config = config,
+            ) ?: continue
+
+            fusion.accumulateFrame(
+                pixels = otherPixels,
+                exposureBiasEv = frame.exposureBiasEv,
+                isReference = false,
+                refLumaPlane = refLumaPlane,
+                refIsEdge = refIsEdge,
+                faceBounds = faceBounds,
+                globalDx = aligned.globalDx,
+                globalDy = aligned.globalDy,
+                tileShifts = aligned.tileShifts,
+                tileCols = aligned.tileCols,
+                tileRows = aligned.tileRows,
+            )
+            confSum += aligned.confidence
+            alignedCount++
+            effectiveFramesMerged++
+        }
+
+        fusion.collapseToPixels(mergedPixels)
+        val alignmentConfidence = if (alignedCount > 0) {
+            (confSum / alignedCount).coerceIn(0.45f, 0.99f)
+        } else {
+            1.0f
+        }
+        return alignmentConfidence to effectiveFramesMerged
+    }
+
+    private suspend fun extractRefLumaAndEdges(
+        mergedPixels: IntArray,
+        width: Int,
+        height: Int,
+        refLumaPlane: FloatArray,
+        refIsEdge: BooleanArray,
+    ) {
+        forEachRowChunk(height) { yStart, yEnd ->
+            for (y in yStart until yEnd) {
+                val rowOff = y * width
+                for (x in 0 until width) {
+                    val i = rowOff + x
+                    val p = mergedPixels[i]
+                    val r = (p shr 16) and 0xFF
+                    val g = (p shr 8) and 0xFF
+                    val b = p and 0xFF
+                    refLumaPlane[i] = 0.299f * r + 0.587f * g + 0.114f * b
+                }
+            }
+        }
+        forEachRowChunk(height) { yStart, yEnd ->
+            for (y in yStart until yEnd) {
+                val rowOff = y * width
+                val yPrev = (y - 1).coerceAtLeast(0) * width
+                val yNext = (y + 1).coerceAtMost(height - 1) * width
+                for (x in 0 until width) {
+                    val xPrev = (x - 1).coerceAtLeast(0)
+                    val xNext = (x + 1).coerceAtMost(width - 1)
+                    val gx = abs(refLumaPlane[rowOff + xNext] - refLumaPlane[rowOff + xPrev])
+                    val gy = abs(refLumaPlane[yNext + x] - refLumaPlane[yPrev + x])
+                    refIsEdge[rowOff + x] = (gx + gy) > 12f
+                }
+            }
+        }
+    }
+
+    private data class FusionAlignmentResult(
+        val globalDx: Int,
+        val globalDy: Int,
+        val tileShifts: IntArray?,
+        val tileCols: Int,
+        val tileRows: Int,
+        val confidence: Float,
+    )
+
+    private fun alignFrameForFusion(
+        otherPixels: IntArray,
+        otherExposureBiasEv: Float,
+        refLumaPlane: FloatArray,
+        refThumb: FloatArray,
+        refMeanLuma: Float,
+        width: Int,
+        height: Int,
+        coarseW: Int,
+        coarseH: Int,
+        config: HdrPipelineConfig,
+    ): FusionAlignmentResult? {
+        val isBrightBracket = otherExposureBiasEv > 0.35f
+        val isDarkBracket = otherExposureBiasEv < -0.35f
+        val isExposureBracket = isBrightBracket || isDarkBracket
+        val tileCols = 8
+        val tileRows = 6
+
+        val otherThumb = createLumaThumbnail(otherPixels, width, height, coarseW, coarseH)
+        val otherMeanLuma = meanOfArray(otherThumb).coerceAtLeast(8f)
+        val exposureGain = if (isExposureBracket) {
+            2f.pow(-otherExposureBiasEv / 2.2f).coerceIn(0.25f, 4.0f)
+        } else {
+            (refMeanLuma / otherMeanLuma).coerceIn(0.35f, 2.85f)
+        }
+
+        val (globalDx, globalDy, conf) = if (config.subPixelAlignment) {
+            val (coarseDx, coarseDy) = estimateCoarseShift(
+                refThumb = refThumb,
+                targetThumb = otherThumb,
+                tw = coarseW,
+                th = coarseH,
+                fullW = width,
+                fullH = height,
+                exposureGain = exposureGain,
+                skipClippedRef = isDarkBracket,
+                skipClippedOther = isBrightBracket,
+            )
+            refineGlobalShiftOnePx(
+                refLumaPlane = refLumaPlane,
+                otherPixels = otherPixels,
+                width = width,
+                height = height,
+                initDx = coarseDx,
+                initDy = coarseDy,
+                exposureGain = exposureGain,
+                skipClippedRef = isDarkBracket,
+                skipClippedOther = isBrightBracket,
+            )
+        } else {
+            Triple(0, 0, 0.96f)
+        }
+
+        val minConf = if (isExposureBracket) 0.10f else 0.56f
+        if (conf < minConf) return null
+
+        val tileShifts = if (config.subPixelAlignment && width >= 128 && height >= 96) {
+            refineLocalTileShifts(
+                refLumaPlane = refLumaPlane,
+                otherPixels = otherPixels,
+                width = width,
+                height = height,
+                globalDx = globalDx,
+                globalDy = globalDy,
+                tileCols = tileCols,
+                tileRows = tileRows,
+                exposureGain = exposureGain,
+                skipClippedRef = isDarkBracket,
+                skipClippedOther = isBrightBracket,
+            )
+        } else null
+
+        return FusionAlignmentResult(
+            globalDx = globalDx,
+            globalDy = globalDy,
+            tileShifts = tileShifts,
+            tileCols = tileCols,
+            tileRows = tileRows,
+            confidence = conf,
+        )
+    }
+
+    /**
+     * Streaming, memory-bounded Multi-Scale Laplacian Pyramid Exposure Fusion accumulator.
+     * Level 0 uses compact ShortArrays (12-bit signed Laplacian + unsigned 16-bit weight) so full
+     * 12.5MP fusion stays well within heap limits while eliminating cutout seams and bright halos.
+     */
+    private inner class PyramidExposureFusion(
+        private val width: Int,
+        private val height: Int,
+    ) {
+        private val lw: IntArray
+        private val lh: IntArray
+        private val levels: Int
+
+        private val accR0: ShortArray
+        private val accG0: ShortArray
+        private val accB0: ShortArray
+        private val accW0: ShortArray
+
+        private val accR: Array<FloatArray>
+        private val accG: Array<FloatArray>
+        private val accB: Array<FloatArray>
+        private val accW: Array<FloatArray>
+
+        private val wellExposedLut: FloatArray
+
+        init {
+            val wList = ArrayList<Int>(6)
+            val hList = ArrayList<Int>(6)
+            var cw = width
+            var ch = height
+            wList.add(cw)
+            hList.add(ch)
+            while (wList.size < 6 && min(cw, ch) >= 12) {
+                cw = (cw + 1) / 2
+                ch = (ch + 1) / 2
+                wList.add(cw)
+                hList.add(ch)
+            }
+            levels = wList.size
+            lw = IntArray(levels) { wList[it] }
+            lh = IntArray(levels) { hList[it] }
+
+            val total0 = width * height
+            accR0 = ShortArray(total0)
+            accG0 = ShortArray(total0)
+            accB0 = ShortArray(total0)
+            accW0 = ShortArray(total0)
+
+            accR = Array(levels) { k -> if (k == 0) FloatArray(0) else FloatArray(lw[k] * lh[k]) }
+            accG = Array(levels) { k -> if (k == 0) FloatArray(0) else FloatArray(lw[k] * lh[k]) }
+            accB = Array(levels) { k -> if (k == 0) FloatArray(0) else FloatArray(lw[k] * lh[k]) }
+            accW = Array(levels) { k -> if (k == 0) FloatArray(0) else FloatArray(lw[k] * lh[k]) }
+
+            // Mid-tone well-exposedness curve with aggressive highlight-clip & shadow-crush suppression
+            wellExposedLut = FloatArray(256) { idx ->
+                val l = idx / 255f
+                val d = l - 0.48f
+                var e = exp(-(d * d) / (2f * 0.22f * 0.22f))
+                if (l > 0.90f) {
+                    // Drive clipped white pixels (248..255) near zero so -EV brackets replace them 99%+
+                    e *= (1f - smoothstep(0.90f, 0.99f, l) * 0.996f)
+                }
+                if (l < 0.07f) {
+                    e *= (0.04f + 0.96f * smoothstep(0.01f, 0.07f, l))
+                }
+                e.coerceIn(0.0005f, 1.0f)
+            }
+        }
+
+        suspend fun accumulateFrame(
+            pixels: IntArray,
+            exposureBiasEv: Float,
+            isReference: Boolean,
+            refLumaPlane: FloatArray,
+            refIsEdge: BooleanArray,
+            faceBounds: IntArray,
+            globalDx: Int,
+            globalDy: Int,
+            tileShifts: IntArray?,
+            tileCols: Int,
+            tileRows: Int,
+        ) {
+            val isDarkBracket = !isReference && exposureBiasEv < -0.35f
+            val isBrightBracket = !isReference && exposureBiasEv > 0.35f
+            val hasFaces = faceBounds.isNotEmpty()
+            val maxBrightLiftScale = if (isBrightBracket) 2f.pow(exposureBiasEv / 1.05f) else 1f
+
+            // Helper to sample the aligned RGB pixel at (x, y)
+            fun alignedPixel(x: Int, y: Int, dx: Int, dy: Int): Int {
+                val sx = (x + dx).coerceIn(0, width - 1)
+                val sy = (y + dy).coerceIn(0, height - 1)
+                return pixels[sy * width + sx]
+            }
+
+            fun computeWeight(x: Int, y: Int, idx: Int, r: Float, g: Float, b: Float): Float {
+                val luma = 0.299f * r + 0.587f * g + 0.114f * b
+                val lumaIdx = luma.toInt().coerceIn(0, 255)
+                val maxC = max(r, max(g, b))
+                val minC = min(r, min(g, b))
+                val sat = if (maxC > 4f) (maxC - minC) / maxC else 0f
+                val baseWell = wellExposedLut[lumaIdx]
+
+                if (isReference) {
+                    return (baseWell * (1f + 0.28f * sat)).coerceIn(0.0005f, 1.0f)
+                }
+
+                val refL = refLumaPlane[idx] * (1f / 255f)
+                val otherL = luma * (1f / 255f)
+                val faceW = if (hasFaces) faceMaskWeight(x, y, faceBounds) else 0f
+
+                if (isDarkBracket) {
+                    // Only recover bright / clipped regions; never darken well-exposed faces or room shadows
+                    val hlGate = smoothstep(0.48f, 0.80f, refL)
+                    if (hlGate <= 0.001f) return 0f
+                    // Reject strong motion ghosts where dark bracket is unexpectedly brighter than 0 EV
+                    val ghostGuard = if (otherL > refL + 0.12f) 0.04f else 1f
+                    // Protect already well-exposed faces from head/blink ghosting during dark brackets
+                    val faceGuard = if (faceW > 0.001f && refL < 0.84f) {
+                        1f - faceW * 0.92f
+                    } else 1f
+                    return (baseWell * (1f + 0.36f * sat) * hlGate * ghostGuard * faceGuard).coerceIn(0f, 1.0f)
+                }
+
+                if (isBrightBracket) {
+                    // Only lift shadowed / dark-face regions; never wash out bright windows
+                    val shGate = 1f - smoothstep(0.32f, 0.62f, refL)
+                    if (shGate <= 0.001f) return 0f
+                    val headroom = if (faceW > 0.25f) 0.22f else 0.28f
+                    val expectedMax = (refL * maxBrightLiftScale + headroom).coerceAtMost(0.96f)
+                    if (otherL < refL * 0.80f || otherL > expectedMax) return 0f
+                    val edgeGuard = if (faceW > 0.25f && refIsEdge[idx]) 0.72f else 1f
+                    return (baseWell * (1f + 0.24f * sat) * shGate * edgeGuard).coerceIn(0f, 1.0f)
+                }
+
+                // Additional 0 EV frame in a 4–5 frame burst: ghost-checked temporal SNR fill
+                val diff = abs(otherL - refL)
+                val limit = if (faceW > 0.25f || refIsEdge[idx]) 0.05f else 0.11f
+                if (diff > limit) return 0f
+                val tW = 1f - (diff / limit)
+                return (baseWell * tW * 0.65f).coerceIn(0f, 1.0f)
+            }
+
+            if (levels == 1) {
+                forEachRowChunk(height) { yStart, yEnd ->
+                    for (y in yStart until yEnd) {
+                        val rowOff = y * width
+                        val tyBase = ((y * tileRows) / height).coerceIn(0, tileRows - 1) * tileCols
+                        for (tx in 0 until tileCols) {
+                            val x0 = (tx * width) / tileCols
+                            val x1 = ((tx + 1) * width) / tileCols
+                            val (dx, dy) = if (tileShifts != null) {
+                                val tIdx = (tyBase + tx) * 2
+                                tileShifts[tIdx] to tileShifts[tIdx + 1]
+                            } else globalDx to globalDy
+                            for (x in x0 until x1) {
+                                val i = rowOff + x
+                                val p = if (isReference) pixels[i] else alignedPixel(x, y, dx, dy)
+                                val r = ((p shr 16) and 0xFF).toFloat()
+                                val g = ((p shr 8) and 0xFF).toFloat()
+                                val b = (p and 0xFF).toFloat()
+                                val w = computeWeight(x, y, i, r, g, b)
+                                if (w > 0.0002f) {
+                                    accR0[i] = (accR0[i].toInt() + (w * r * 16f).toInt()).coerceIn(-32767, 32767).toShort()
+                                    accG0[i] = (accG0[i].toInt() + (w * g * 16f).toInt()).coerceIn(-32767, 32767).toShort()
+                                    accB0[i] = (accB0[i].toInt() + (w * b * 16f).toInt()).coerceIn(-32767, 32767).toShort()
+                                    val nw = ((accW0[i].toInt() and 0xFFFF) + (w * 4096f).toInt()).coerceIn(0, 65535)
+                                    accW0[i] = nw.toShort()
+                                }
+                            }
+                        }
+                    }
+                }
+                return
+            }
+
+            // Pass 1 (Parallel): Downsample Level 0 -> Level 1 (RGB + W) directly from aligned pixels
+            // using a 3x3 tent kernel centered at (2*x1, 2*y1) — zero full-res float allocations!
+            val w1 = lw[1]
+            val h1 = lh[1]
+            val size1 = w1 * h1
+            var curR = FloatArray(size1)
+            var curG = FloatArray(size1)
+            var curB = FloatArray(size1)
+            var curW = FloatArray(size1)
+
+            forEachRowChunk(h1) { y1Start, y1End ->
+                for (y1 in y1Start until y1End) {
+                    val cy = (y1 shl 1).coerceAtMost(height - 1)
+                    val tyBase = ((cy * tileRows) / height).coerceIn(0, tileRows - 1) * tileCols
+                    val dstRow = y1 * w1
+                    for (x1 in 0 until w1) {
+                        val cx = (x1 shl 1).coerceAtMost(width - 1)
+                        val tx = ((cx * tileCols) / width).coerceIn(0, tileCols - 1)
+                        val (dx, dy) = if (tileShifts != null) {
+                            val tIdx = (tyBase + tx) * 2
+                            tileShifts[tIdx] to tileShifts[tIdx + 1]
+                        } else globalDx to globalDy
+
+                        var sr = 0f
+                        var sg = 0f
+                        var sb = 0f
+                        var sw = 0f
+                        var kSum = 0f
+                        for (oy in -1..1) {
+                            val ky = if (oy == 0) 2f else 1f
+                            val py = (cy + oy).coerceIn(0, height - 1)
+                            val pRowOff = py * width
+                            for (ox in -1..1) {
+                                val kx = if (ox == 0) 2f else 1f
+                                val k = kx * ky
+                                val px = (cx + ox).coerceIn(0, width - 1)
+                                val pIdx = pRowOff + px
+                                val p = if (isReference) pixels[pIdx] else alignedPixel(px, py, dx, dy)
+                                val r = ((p shr 16) and 0xFF).toFloat()
+                                val g = ((p shr 8) and 0xFF).toFloat()
+                                val b = (p and 0xFF).toFloat()
+                                val wt = computeWeight(px, py, pIdx, r, g, b)
+                                sr += r * k
+                                sg += g * k
+                                sb += b * k
+                                sw += wt * k
+                                kSum += k
+                            }
+                        }
+                        val invK = 1f / kSum
+                        val di = dstRow + x1
+                        curR[di] = sr * invK
+                        curG[di] = sg * invK
+                        curB[di] = sb * invK
+                        curW[di] = sw * invK
+                    }
+                }
+            }
+
+            // Pass 2 (Parallel): Compute Level 0 Laplacian = I0 - expand(I1) on the fly and accumulate into ShortArrays
+            forEachRowChunk(height) { yStart, yEnd ->
+                for (y in yStart until yEnd) {
+                    val rowOff = y * width
+                    val tyBase = ((y * tileRows) / height).coerceIn(0, tileRows - 1) * tileCols
+                    val y1a = (y shr 1).coerceAtMost(h1 - 1)
+                    val y1b = (y1a + 1).coerceAtMost(h1 - 1)
+                    val wy = if ((y and 1) == 0) 0f else 0.5f
+                    val r1a = y1a * w1
+                    val r1b = y1b * w1
+
+                    for (tx in 0 until tileCols) {
+                        val xStart = (tx * width) / tileCols
+                        val xEnd = ((tx + 1) * width) / tileCols
+                        val (dx, dy) = if (tileShifts != null) {
+                            val tIdx = (tyBase + tx) * 2
+                            tileShifts[tIdx] to tileShifts[tIdx + 1]
+                        } else globalDx to globalDy
+
+                        for (x in xStart until xEnd) {
+                            val i = rowOff + x
+                            val p = if (isReference) pixels[i] else alignedPixel(x, y, dx, dy)
+                            val r = ((p shr 16) and 0xFF).toFloat()
+                            val g = ((p shr 8) and 0xFF).toFloat()
+                            val b = (p and 0xFF).toFloat()
+                            val w = computeWeight(x, y, i, r, g, b)
+                            if (w <= 0.0002f) continue
+
+                            val x1a = (x shr 1).coerceAtMost(w1 - 1)
+                            val x1b = (x1a + 1).coerceAtMost(w1 - 1)
+                            val wx = if ((x and 1) == 0) 0f else 0.5f
+
+                            val upR = bilinearSample(curR, r1a, r1b, x1a, x1b, wx, wy)
+                            val upG = bilinearSample(curG, r1a, r1b, x1a, x1b, wx, wy)
+                            val upB = bilinearSample(curB, r1a, r1b, x1a, x1b, wx, wy)
+
+                            val lapR = r - upR
+                            val lapG = g - upG
+                            val lapB = b - upB
+
+                            accR0[i] = (accR0[i].toInt() + (w * lapR * 16f).toInt()).coerceIn(-32767, 32767).toShort()
+                            accG0[i] = (accG0[i].toInt() + (w * lapG * 16f).toInt()).coerceIn(-32767, 32767).toShort()
+                            accB0[i] = (accB0[i].toInt() + (w * lapB * 16f).toInt()).coerceIn(-32767, 32767).toShort()
+                            val nw = ((accW0[i].toInt() and 0xFFFF) + (w * 4096f).toInt()).coerceIn(0, 65535)
+                            accW0[i] = nw.toShort()
+                        }
+                    }
+                }
+            }
+
+            // Pass 3: Build & accumulate Levels 1 .. levels - 1 (<= 25% resolution, very fast)
+            for (k in 1 until levels - 1) {
+                val sw = lw[k]
+                val sh = lh[k]
+                val dw = lw[k + 1]
+                val dh = lh[k + 1]
+                val nextR = reducePlaneGaussian(curR, sw, sh, dw, dh)
+                val nextG = reducePlaneGaussian(curG, sw, sh, dw, dh)
+                val nextB = reducePlaneGaussian(curB, sw, sh, dw, dh)
+                val nextW = reducePlaneGaussian(curW, sw, sh, dw, dh)
+
+                val dstAccR = accR[k]
+                val dstAccG = accG[k]
+                val dstAccB = accB[k]
+                val dstAccW = accW[k]
+
+                for (y in 0 until sh) {
+                    val rowOff = y * sw
+                    val ya = (y shr 1).coerceAtMost(dh - 1)
+                    val yb = (ya + 1).coerceAtMost(dh - 1)
+                    val wy = if ((y and 1) == 0) 0f else 0.5f
+                    val ra = ya * dw
+                    val rb = yb * dw
+                    for (x in 0 until sw) {
+                        val i = rowOff + x
+                        val w = curW[i]
+                        if (w <= 0.0001f) continue
+                        val xa = (x shr 1).coerceAtMost(dw - 1)
+                        val xb = (xa + 1).coerceAtMost(dw - 1)
+                        val wx = if ((x and 1) == 0) 0f else 0.5f
+                        val upR = bilinearSample(nextR, ra, rb, xa, xb, wx, wy)
+                        val upG = bilinearSample(nextG, ra, rb, xa, xb, wx, wy)
+                        val upB = bilinearSample(nextB, ra, rb, xa, xb, wx, wy)
+                        dstAccR[i] += w * (curR[i] - upR)
+                        dstAccG[i] += w * (curG[i] - upG)
+                        dstAccB[i] += w * (curB[i] - upB)
+                        dstAccW[i] += w
+                    }
+                }
+
+                curR = nextR
+                curG = nextG
+                curB = nextB
+                curW = nextW
+            }
+
+            // Coarsest Gaussian base level
+            val top = levels - 1
+            val topAccR = accR[top]
+            val topAccG = accG[top]
+            val topAccB = accB[top]
+            val topAccW = accW[top]
+            for (i in curR.indices) {
+                val w = curW[i]
+                if (w > 0.0001f) {
+                    topAccR[i] += w * curR[i]
+                    topAccG[i] += w * curG[i]
+                    topAccB[i] += w * curB[i]
+                    topAccW[i] += w
+                }
+            }
+        }
+
+        suspend fun collapseToPixels(outPixels: IntArray) {
+            if (levels == 1) {
+                forEachRowChunk(height) { yStart, yEnd ->
+                    val s = yStart * width
+                    val e = yEnd * width
+                    for (i in s until e) {
+                        val wSum = ((accW0[i].toInt() and 0xFFFF) / 4096f).coerceAtLeast(1e-4f)
+                        val r = ((accR0[i].toFloat() / 16f) / wSum).toInt().coerceIn(0, 255)
+                        val g = ((accG0[i].toFloat() / 16f) / wSum).toInt().coerceIn(0, 255)
+                        val b = ((accB0[i].toFloat() / 16f) / wSum).toInt().coerceIn(0, 255)
+                        outPixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                    }
+                }
+                return
+            }
+
+            val top = levels - 1
+            var reconR = FloatArray(lw[top] * lh[top]) { i ->
+                accR[top][i] / accW[top][i].coerceAtLeast(1e-4f)
+            }
+            var reconG = FloatArray(lw[top] * lh[top]) { i ->
+                accG[top][i] / accW[top][i].coerceAtLeast(1e-4f)
+            }
+            var reconB = FloatArray(lw[top] * lh[top]) { i ->
+                accB[top][i] / accW[top][i].coerceAtLeast(1e-4f)
+            }
+
+            for (k in (levels - 2) downTo 1) {
+                val dw = lw[k]
+                val dh = lh[k]
+                val sw = lw[k + 1]
+                val sh = lh[k + 1]
+                val nextR = FloatArray(dw * dh)
+                val nextG = FloatArray(dw * dh)
+                val nextB = FloatArray(dw * dh)
+                val lapR = accR[k]
+                val lapG = accG[k]
+                val lapB = accB[k]
+                val wArr = accW[k]
+
+                for (y in 0 until dh) {
+                    val rowOff = y * dw
+                    val ya = (y shr 1).coerceAtMost(sh - 1)
+                    val yb = (ya + 1).coerceAtMost(sh - 1)
+                    val wy = if ((y and 1) == 0) 0f else 0.5f
+                    val ra = ya * sw
+                    val rb = yb * sw
+                    for (x in 0 until dw) {
+                        val i = rowOff + x
+                        val xa = (x shr 1).coerceAtMost(sw - 1)
+                        val xb = (xa + 1).coerceAtMost(sw - 1)
+                        val wx = if ((x and 1) == 0) 0f else 0.5f
+                        val invW = 1f / wArr[i].coerceAtLeast(1e-4f)
+                        nextR[i] = bilinearSample(reconR, ra, rb, xa, xb, wx, wy) + lapR[i] * invW
+                        nextG[i] = bilinearSample(reconG, ra, rb, xa, xb, wx, wy) + lapG[i] * invW
+                        nextB[i] = bilinearSample(reconB, ra, rb, xa, xb, wx, wy) + lapB[i] * invW
+                    }
+                }
+                reconR = nextR
+                reconG = nextG
+                reconB = nextB
+            }
+
+            // Collapse Level 1 + Level 0 Laplacian directly into output ARGB pixels in parallel
+            val w1 = lw[1]
+            val h1 = lh[1]
+            val finalBaseR = reconR
+            val finalBaseG = reconG
+            val finalBaseB = reconB
+            forEachRowChunk(height) { yStart, yEnd ->
+                for (y in yStart until yEnd) {
+                    val rowOff = y * width
+                    val ya = (y shr 1).coerceAtMost(h1 - 1)
+                    val yb = (ya + 1).coerceAtMost(h1 - 1)
+                    val wy = if ((y and 1) == 0) 0f else 0.5f
+                    val ra = ya * w1
+                    val rb = yb * w1
+                    for (x in 0 until width) {
+                        val i = rowOff + x
+                        val xa = (x shr 1).coerceAtMost(w1 - 1)
+                        val xb = (xa + 1).coerceAtMost(w1 - 1)
+                        val wx = if ((x and 1) == 0) 0f else 0.5f
+
+                        val upR = bilinearSample(finalBaseR, ra, rb, xa, xb, wx, wy)
+                        val upG = bilinearSample(finalBaseG, ra, rb, xa, xb, wx, wy)
+                        val upB = bilinearSample(finalBaseB, ra, rb, xa, xb, wx, wy)
+
+                        val wSum = ((accW0[i].toInt() and 0xFFFF) / 4096f).coerceAtLeast(1e-4f)
+                        val invW = (1f / 16f) / wSum
+                        val r = (upR + accR0[i].toFloat() * invW).toInt().coerceIn(0, 255)
+                        val g = (upG + accG0[i].toFloat() * invW).toInt().coerceIn(0, 255)
+                        val b = (upB + accB0[i].toFloat() * invW).toInt().coerceIn(0, 255)
+                        outPixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                    }
+                }
+            }
+        }
+
+        private fun bilinearSample(
+            plane: FloatArray,
+            rowA: Int,
+            rowB: Int,
+            xA: Int,
+            xB: Int,
+            wx: Float,
+            wy: Float,
+        ): Float {
+            val v00 = plane[rowA + xA]
+            val v10 = plane[rowA + xB]
+            val v01 = plane[rowB + xA]
+            val v11 = plane[rowB + xB]
+            val top = v00 + (v10 - v00) * wx
+            val bot = v01 + (v11 - v01) * wx
+            return top + (bot - top) * wy
+        }
+
+        private fun reducePlaneGaussian(
+            src: FloatArray,
+            sw: Int,
+            sh: Int,
+            dw: Int,
+            dh: Int,
+        ): FloatArray {
+            // Separable 5-tap [1, 4, 6, 4, 1]/16 horizontal pass with 2x decimation
+            val tmp = FloatArray(dw * sh)
+            for (y in 0 until sh) {
+                val sRow = y * sw
+                val tRow = y * dw
+                for (dx in 0 until dw) {
+                    val cx = dx shl 1
+                    val c0 = src[sRow + (cx - 2).coerceIn(0, sw - 1)]
+                    val c1 = src[sRow + (cx - 1).coerceIn(0, sw - 1)]
+                    val c2 = src[sRow + cx.coerceIn(0, sw - 1)]
+                    val c3 = src[sRow + (cx + 1).coerceIn(0, sw - 1)]
+                    val c4 = src[sRow + (cx + 2).coerceIn(0, sw - 1)]
+                    tmp[tRow + dx] = (c0 + 4f * c1 + 6f * c2 + 4f * c3 + c4) * (1f / 16f)
+                }
+            }
+            // Vertical 5-tap pass with 2x decimation
+            val dst = FloatArray(dw * dh)
+            for (dy in 0 until dh) {
+                val cy = dy shl 1
+                val r0 = (cy - 2).coerceIn(0, sh - 1) * dw
+                val r1 = (cy - 1).coerceIn(0, sh - 1) * dw
+                val r2 = cy.coerceIn(0, sh - 1) * dw
+                val r3 = (cy + 1).coerceIn(0, sh - 1) * dw
+                val r4 = (cy + 2).coerceIn(0, sh - 1) * dw
+                val dRow = dy * dw
+                for (dx in 0 until dw) {
+                    dst[dRow + dx] = (tmp[r0 + dx] + 4f * tmp[r1 + dx] + 6f * tmp[r2 + dx] +
+                        4f * tmp[r3 + dx] + tmp[r4 + dx]) * (1f / 16f)
+                }
+            }
+            return dst
+        }
     }
 
     /**
@@ -2480,28 +3337,39 @@ class HdrPlusEngine {
         fullW: Int,
         fullH: Int,
         exposureGain: Float,
+        skipClippedRef: Boolean = false,
+        skipClippedOther: Boolean = false,
     ): Pair<Int, Int> {
         val searchRadius = 12
         var bestDx = 0
         var bestDy = 0
-        var bestSad = Float.MAX_VALUE
+        var bestMeanSad = Float.MAX_VALUE
         val margin = searchRadius + 4
 
         for (dy in -searchRadius..searchRadius) {
             for (dx in -searchRadius..searchRadius) {
                 var sad = 0f
+                var cnt = 0
                 for (y in margin until (th - margin) step 2) {
                     val rRow = y * tw
                     val tRow = (y + dy) * tw
                     for (x in margin until (tw - margin) step 2) {
-                        val normTarget = (targetThumb[tRow + x + dx] * exposureGain).coerceAtMost(255f)
-                        sad += abs(refThumb[rRow + x] - normTarget)
+                        val refVal = refThumb[rRow + x]
+                        val otherRaw = targetThumb[tRow + x + dx]
+                        if (skipClippedRef && refVal >= 242f) continue
+                        if (skipClippedOther && otherRaw >= 242f) continue
+                        val normTarget = (otherRaw * exposureGain).coerceAtMost(255f)
+                        sad += abs(refVal - normTarget)
+                        cnt++
                     }
                 }
-                if (sad < bestSad) {
-                    bestSad = sad
-                    bestDx = dx
-                    bestDy = dy
+                if (cnt > 0) {
+                    val meanSad = sad / cnt
+                    if (meanSad < bestMeanSad) {
+                        bestMeanSad = meanSad
+                        bestDx = dx
+                        bestDy = dy
+                    }
                 }
             }
         }
@@ -2519,6 +3387,8 @@ class HdrPlusEngine {
         initDx: Int,
         initDy: Int,
         exposureGain: Float,
+        skipClippedRef: Boolean = false,
+        skipClippedOther: Boolean = false,
     ): Triple<Int, Int, Float> {
         val fineRadius = 8
         val maxMargin = (abs(initDx) + abs(initDy) + fineRadius + 4).coerceAtMost(min(width, height) / 3)
@@ -2530,7 +3400,7 @@ class HdrPlusEngine {
 
         var bestDx = initDx
         var bestDy = initDy
-        var bestSad = Float.MAX_VALUE
+        var bestMeanSad = Float.MAX_VALUE
         var sampleCount = 0
 
         for (oy in -fineRadius..fineRadius) {
@@ -2548,21 +3418,27 @@ class HdrPlusEngine {
                         val sx = x + dx
                         if (sx < 0 || sx >= width) continue
                         val refL = refLumaPlane[rRow + x]
-                        val otherL = (lumaOf(otherPixels[sRow + sx]) * exposureGain).coerceAtMost(255f)
+                        val otherRaw = lumaOf(otherPixels[sRow + sx])
+                        if (skipClippedRef && refL >= 242f) continue
+                        if (skipClippedOther && otherRaw >= 242f) continue
+                        val otherL = (otherRaw * exposureGain).coerceAtMost(255f)
                         sad += abs(refL - otherL)
                         cnt++
                     }
                 }
-                if (cnt > 0 && sad < bestSad) {
-                    bestSad = sad
-                    bestDx = dx
-                    bestDy = dy
-                    sampleCount = cnt
+                if (cnt > 0) {
+                    val meanSad = sad / cnt
+                    if (meanSad < bestMeanSad) {
+                        bestMeanSad = meanSad
+                        bestDx = dx
+                        bestDy = dy
+                        sampleCount = cnt
+                    }
                 }
             }
         }
 
-        val normMeanDiff = if (sampleCount > 0) bestSad / (sampleCount * 255f) else 0.25f
+        val normMeanDiff = if (sampleCount > 0) bestMeanSad / 255f else 0.25f
         val confidence = (1f - normMeanDiff * 3.8f).coerceIn(0.35f, 0.99f)
         return Triple(bestDx, bestDy, confidence)
     }
@@ -2577,6 +3453,8 @@ class HdrPlusEngine {
         tileCols: Int,
         tileRows: Int,
         exposureGain: Float,
+        skipClippedRef: Boolean = false,
+        skipClippedOther: Boolean = false,
     ): IntArray {
         val result = IntArray(tileCols * tileRows * 2)
         val localRadius = 3
@@ -2592,7 +3470,7 @@ class HdrPlusEngine {
 
                 var bestDx = globalDx
                 var bestDy = globalDy
-                var bestSad = Float.MAX_VALUE
+                var bestMeanScore = Float.MAX_VALUE
 
                 for (oy in -localRadius..localRadius) {
                     val dy = globalDy + oy
@@ -2609,17 +3487,21 @@ class HdrPlusEngine {
                                 val sx = x + dx
                                 if (sx < 0 || sx >= width) continue
                                 val refL = refLumaPlane[rRow + x]
-                                val otherL = (lumaOf(otherPixels[sRow + sx]) * exposureGain).coerceAtMost(255f)
+                                val otherRaw = lumaOf(otherPixels[sRow + sx])
+                                if (skipClippedRef && refL >= 242f) continue
+                                if (skipClippedOther && otherRaw >= 242f) continue
+                                val otherL = (otherRaw * exposureGain).coerceAtMost(255f)
                                 sad += abs(refL - otherL)
                                 cnt++
                             }
                         }
-                        val priorPenalty = (abs(ox) + abs(oy)) * cnt * 0.25f
-                        val score = sad + priorPenalty
-                        if (cnt > 0 && score < bestSad) {
-                            bestSad = score
-                            bestDx = dx
-                            bestDy = dy
+                        if (cnt > 0) {
+                            val meanScore = (sad / cnt) + (abs(ox) + abs(oy)) * 0.25f
+                            if (meanScore < bestMeanScore) {
+                                bestMeanScore = meanScore
+                                bestDx = dx
+                                bestDy = dy
+                            }
                         }
                     }
                 }

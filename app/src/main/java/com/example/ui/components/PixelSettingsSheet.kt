@@ -209,24 +209,14 @@ fun PixelSettingsSheet(
             }
             item(key = "row_pixel_services", contentType = "switch") {
                 val servicesSubtitle = when {
-                    pixelCameraServicesEnabled && activePixelExtensionMode != PixelExtensionMode.NONE ->
-                        "Active (${activePixelExtensionMode.badge}) • Locks Pro controls, custom HDR+ & live HUD"
-                    pixelCameraServicesEnabled && isPixelNightOnlyDevice -> {
-                        val daylightEngine = if (nativeUltraHdrActive) {
-                            "custom HDR+ & Native Ultra HDR"
-                        } else {
-                            "custom HDR+ engine"
-                        }
-                        "Night Sight only on this device • Auto-activates in low light; daylight uses $daylightEngine"
-                    }
+                    pixelCameraServicesEnabled && activePixelExtensionMode == PixelExtensionMode.NIGHT ->
+                        "Active (Pixel Night) • Locks Pro controls & live HUD during Night Sight"
                     pixelCameraServicesEnabled && hasCheckedPixelExtensions && !pixelExtensionsSupported ->
-                        "Unavailable on this lens/device — using custom HDR+ engine"
+                        "Pixel Night unavailable on this lens/device — using custom Night Sight"
                     pixelCameraServicesEnabled ->
-                        "Enabled • Locks Pro controls & custom HDR+ while active"
-                    isPixelNightOnlyDevice ->
-                        "Use Google's Pixel Night Sight in low light (daylight stays on custom HDR+ & Ultra HDR)"
+                        "Night Sight only • Activates in low light; daylight & Backlight use custom HDR+"
                     else ->
-                        "Use Google's native Pixel Camera Services (locks Pro controls while active)"
+                        "Use Google's Pixel Night Sight in low light (all other modes use custom HDR+)"
                 }
                 PixelSwitchRow(
                     icon = Icons.Rounded.AutoAwesome,
@@ -242,7 +232,7 @@ fun PixelSettingsSheet(
                 )
             }
             item(key = "row_night_sight", contentType = "picker") {
-                val usesPixelNight = pixelCameraServicesEnabled && (isPixelNightOnlyDevice || isPixelServicesLocked)
+                val usesPixelNight = pixelCameraServicesEnabled && (pixelExtensionsSupported || !hasCheckedPixelExtensions)
                 PixelPickerRow(
                     icon = Icons.Rounded.NightsStay,
                     title = "Low Light / Night Sight",
@@ -272,7 +262,6 @@ fun PixelSettingsSheet(
                     title = "HDR+ control",
                     valueLabel = when {
                         isNightSightActive -> "Off (disabled in Low Light)"
-                        isPixelServicesLocked && hdrMode != HdrMode.OFF -> "${hdrMode.label} (Pixel HDR)"
                         else -> hdrMode.label
                     },
                     position = ExpressiveListPosition.MIDDLE,

@@ -31,8 +31,6 @@ enum class BacklightMode(val label: String, val badge: String) {
 
 enum class PixelExtensionMode(val label: String, val badge: String) {
     NONE("Off", "Off"),
-    AUTO("Auto", "Pixel Auto"),
-    HDR("HDR", "Pixel HDR"),
     NIGHT("Night", "Pixel Night"),
 }
 
@@ -802,9 +800,10 @@ object LowLightDetector {
     }
 
     /**
-     * Detects strongly backlit / high-dynamic-range scenes where a bright light behind the subject
-     * simultaneously clips highlights while leaving the subject's front shadows crushed — OR when
-     * a detected face is significantly darker than the surrounding scene/highlights.
+     * Detects backlit / high-dynamic-range scenes where:
+     * 1. Highlights clip while shadows are crushed (classic split/silhouette backlight),
+     * 2. A detected face is much darker than the bright surround, OR
+     * 3. Hardware AE metered cleanly for the face/room, leaving a bright window/sky behind heavily clipped.
      */
     fun isBacklitScene(
         clippedHighlightPercent: Float,
@@ -814,12 +813,127 @@ object LowLightDetector {
     ): Boolean {
         val strongSplit = clippedHighlightPercent >= 3.5f && crushedShadowPercent >= 16f
         val extremeBacklight = clippedHighlightPercent >= 6.5f && crushedShadowPercent >= 10f && meanLuma < 0.62f
+        val heavyHighlightClip = clippedHighlightPercent >= 12.0f && meanLuma < 0.80f
         val backlitFace = if (faceMeanLuma != null) {
             val faceMuchDarkerThanBg = faceMeanLuma < 0.38f && (meanLuma - faceMeanLuma) >= 0.16f
             val darkFaceWithBrightBg = faceMeanLuma < 0.42f && clippedHighlightPercent >= 1.8f
-            faceMuchDarkerThanBg || darkFaceWithBrightBg
+            // Hardware AE exposed the face properly while a bright window/sky behind is blown out
+            val wellExposedFaceWithBlownWindow = faceMeanLuma <= 0.74f && clippedHighlightPercent >= 5.5f
+            faceMuchDarkerThanBg || darkFaceWithBrightBg || wellExposedFaceWithBlownWindow
         } else false
-        return strongSplit || extremeBacklight || backlitFace
+        return strongSplit || extremeBacklight || heavyHighlightClip || backlitFace
+    }
+
+    /**
+     * Plans adaptive EV exposure brackets for backlit multi-exposure fusion:
+     * - When AE already exposed the face/foreground well and the window/sky is blown out,
+     *   allocates deep negative brackets (-2.0 / -4.0 EV) to recover outdoor highlight detail
+     *   without wasting a +EV frame.
+     * - When the face or foreground is dark/silhouetted against a bright background,
+     *   captures both deep highlight protection (-2.5 EV / -3.75 EV) and shadow fill (+1.5 EV).
+     */
+    fun planBacklightBracketEvs(
+        totalFrames: Int,
+        clippedHighlightPercent: Float,
+        crushedShadowPercent: Float,
+        meanLuma: Float,
+        faceMeanLuma: Float? = null,
+    ): FloatArray {
+        val frames = totalFrames.coerceAtLeast(2)
+        val darkFace = faceMeanLuma != null && faceMeanLuma < 0.42f
+        val darkShadows = crushedShadowPercent >= 12f || (faceMeanLuma == null && meanLuma < 0.42f)
+        val needsShadowLift = darkFace || darkShadows
+        val severeHighlights = clippedHighlightPercent >= 10f
+
+        if (!needsShadowLift) {
+            return when (frames) {
+                2 -> floatArrayOf(0f, if (severeHighlights) -3.0f else -2.5f)
+                3 -> if (severeHighlights) {
+                    floatArrayOf(0f, -2.0f, -4.0f)
+                } else {
+                    floatArrayOf(0f, -1.75f, -3.5f)
+                }
+                4 -> floatArrayOf(0f, -1.5f, -3.0f, -4.5f)
+                else -> FloatArray(frames) { idx ->
+                    when (idx) {
+                        0 -> 0f
+                        1 -> -1.75f
+                        2 -> -3.5f
+                        3 -> -4.5f
+                        else -> 0f
+                    }
+                }
+            }
+        }
+
+        return when (frames) {
+            2 -> floatArrayOf(0f, if (clippedHighlightPercent >= 5.5f) -2.5f else 1.5f)
+            3 -> floatArrayOf(0f, if (severeHighlights) -3.0f else -2.5f, 1.5f)
+            4 -> floatArrayOf(0f, -2.0f, -3.75f, 1.5f)
+            else -> FloatArray(frames) { idx ->
+                when (idx) {
+                    0 -> 0f
+                    1 -> -2.0f
+                    2 -> -3.75f
+                    3 -> 1.5f
+                    else -> 0f
+                }
+            }
+        }
+    }
+
+    /**
+     * Computes exact hardware manual `(exposureTimeNs, iso)` for a single exposure bracket step
+     * relative to the metered `(baselineIso, baselineExposureNs)`:
+     * - Negative EV (highlight recovery): lowers ISO toward minimum and shortens shutter speed
+     *   (never slower than baseline) so dark frames are both low-noise and motion-freeze sharp.
+     * - Positive EV (shadow/face lift): lengthens shutter up to a handheld-portrait-safe cap
+     *   before raising ISO so faces stay clean without motion blur.
+     */
+    fun computeManualBracketExposure(
+        baselineIso: Int,
+        baselineExposureNs: Long,
+        evOffset: Float,
+        isoRange: IntRange,
+        exposureTimeRangeNs: LongRange,
+    ): Pair<Long, Int> {
+        val minIso = isoRange.first.coerceAtLeast(25)
+        val maxIso = isoRange.last.coerceAtLeast(minIso)
+        val minExp = exposureTimeRangeNs.first.coerceAtLeast(50_000L)
+        val maxExp = exposureTimeRangeNs.last.coerceAtLeast(minExp)
+
+        val safeBaseIso = baselineIso.coerceIn(minIso, maxIso)
+        val safeBaseExp = baselineExposureNs.coerceIn(minExp, maxExp)
+        if (abs(evOffset) <= 0.05f) {
+            return safeBaseExp to safeBaseIso
+        }
+
+        val baseProduct = safeBaseIso.toDouble() * safeBaseExp.toDouble()
+        val targetProduct = (baseProduct * 2.0.pow(evOffset.toDouble()))
+            .coerceIn(minIso.toDouble() * minExp.toDouble(), maxIso.toDouble() * maxExp.toDouble())
+
+        return if (evOffset < 0f) {
+            val shutterAtMinIso = (targetProduct / minIso.toDouble()).toLong()
+            if (shutterAtMinIso <= safeBaseExp) {
+                val targetExp = shutterAtMinIso.coerceIn(minExp, maxExp)
+                val targetIso = (targetProduct / targetExp.toDouble()).toInt().coerceIn(minIso, maxIso)
+                targetExp to targetIso
+            } else {
+                // Dropping all the way to minIso would slow the shutter below baseline;
+                // keep shutter fast (<= 12ms) and drop ISO proportionally instead.
+                val fastShutterCap = minOf(safeBaseExp, 12_000_000L).coerceIn(minExp, maxExp)
+                val solvedIso = (targetProduct / fastShutterCap.toDouble()).toInt().coerceIn(minIso, maxIso)
+                val finalExp = (targetProduct / solvedIso.toDouble()).toLong().coerceIn(minExp, fastShutterCap)
+                finalExp to solvedIso
+            }
+        } else {
+            // Positive EV shadow lift: cap portrait shutter at 33ms (or baseline if already slower)
+            val portraitShutterCap = maxOf(safeBaseExp, 33_333_333L).coerceAtMost(maxExp)
+            val preferredExp = (targetProduct / safeBaseIso.toDouble()).toLong()
+                .coerceIn(safeBaseExp, portraitShutterCap)
+            val solvedIso = (targetProduct / preferredExp.toDouble()).toInt().coerceIn(minIso, maxIso)
+            preferredExp to solvedIso
+        }
     }
 }
 
