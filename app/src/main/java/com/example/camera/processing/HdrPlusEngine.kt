@@ -383,26 +383,39 @@ class HdrPlusEngine {
         // image is genuinely still dark, never double-brightening well-exposed long exposures.
         var adaptiveNightGain = 1.0f
         var adaptiveNightShadowLift = 0f
-        if (nightSightEnabled && !isPixelExtensionCapture) {
-            val (meanLuma, p92Luma) = estimateLumaStats(mergedPixels, width, height)
+        val isCustomNightSight = nightSightEnabled && !isPixelExtensionCapture
+        if (isCustomNightSight) {
+            val stats = estimateLumaStats(mergedPixels, width, height)
+            val meanLuma = stats.mean
+            val p96Luma = stats.p96
+            val clippedPct = stats.clippedPercent
             when {
-                meanLuma < 0.34f -> {
-                    val targetMean = 0.34f
-                    val rawGain = (targetMean / meanLuma.coerceAtLeast(0.06f)).coerceIn(1.0f, 1.95f)
-                    // Strictly protect highlights: cap drops to 1.0 when p92 is already bright
-                    val highlightCap = (0.88f / p92Luma.coerceAtLeast(0.32f)).coerceIn(1.0f, 1.95f)
-                    adaptiveNightGain = min(rawGain, highlightCap)
-                    // Smooth shadow lift that fades cleanly to 0 as meanLuma approaches 0.34
-                    val darknessRatio = ((0.34f - meanLuma) / 0.28f).coerceIn(0f, 1f)
-                    adaptiveNightShadowLift = darknessRatio * 0.34f
-                }
-                meanLuma > 0.54f -> {
-                    // Hardware captured slightly hot — pull exposure back smoothly to prevent blown highlights
-                    adaptiveNightGain = (0.48f / meanLuma).coerceIn(0.68f, 1.0f)
+                meanLuma > 0.46f || (clippedPct > 6f && meanLuma > 0.36f) -> {
+                    // Hardware captured hot or clipped — pull exposure back cleanly to prevent blown highlights
+                    val meanPull = (0.38f / meanLuma.coerceAtLeast(0.39f)).coerceIn(0.55f, 1.0f)
+                    val clipPull = if (clippedPct > 6f) {
+                        (1f - ((clippedPct - 6f) / 45f)).coerceIn(0.72f, 0.96f)
+                    } else 1.0f
+                    adaptiveNightGain = min(meanPull, clipPull).coerceIn(0.55f, 1.0f)
                     adaptiveNightShadowLift = 0f
                 }
+                meanLuma < 0.28f -> {
+                    val targetMean = 0.28f
+                    val rawGain = (targetMean / meanLuma.coerceAtLeast(0.06f)).coerceIn(1.0f, 1.65f)
+                    // Strictly protect highlights using p96 (top 4%): drop global gain to 1.0 when
+                    // bright areas already approach clipping, letting shadow-only lift brighten darks safely.
+                    val highlightCap = if (clippedPct > 1.5f) {
+                        1.0f
+                    } else {
+                        (0.84f / p96Luma.coerceAtLeast(0.30f)).coerceIn(1.0f, 1.65f)
+                    }
+                    adaptiveNightGain = min(rawGain, highlightCap)
+                    // Smooth shadow-only lift that tapers to zero at highlights (v -> 1.0)
+                    val darknessRatio = ((0.28f - meanLuma) / 0.22f).coerceIn(0f, 1f)
+                    adaptiveNightShadowLift = darknessRatio * 0.36f
+                }
                 else -> {
-                    // Already well-exposed by the long shutter: keep natural exposure, zero extra lift!
+                    // Already well-exposed in [0.28, 0.46]: keep natural exposure, zero extra lift!
                     adaptiveNightGain = 1.0f
                     adaptiveNightShadowLift = 0f
                 }
@@ -424,9 +437,10 @@ class HdrPlusEngine {
         val shadowLiftAmount = (effectiveShadowSlider * 0.45f + adaptiveNightShadowLift).coerceIn(-0.55f, 0.85f)
         val highlightRecoverBase = (config.highlightRecovery * hdrStrength).coerceIn(0f, 1f)
         val highlightAdjust = manual.highlightBoost.coerceIn(-1f, 1f)
-        val contrastAmount = (manual.contrastAdjust + if (cinematicOn) ToneColorMath.CINEMATIC_CONTRAST_OFFSET else 0f + if (nightSightEnabled && !isPixelExtensionCapture) 0.08f else 0f)
+        val nightContrastBoost = if (isCustomNightSight && adaptiveNightGain >= 1.0f) 0.03f else 0f
+        val contrastAmount = (manual.contrastAdjust + if (cinematicOn) ToneColorMath.CINEMATIC_CONTRAST_OFFSET else 0f + nightContrastBoost)
             .coerceIn(-1f, 1f)
-        val vibrancyAmount = (manual.vibrancyAdjust + if (cinematicOn) ToneColorMath.CINEMATIC_VIBRANCY_OFFSET else 0f + if (nightSightEnabled && !isPixelExtensionCapture) 0.14f else 0f)
+        val vibrancyAmount = (manual.vibrancyAdjust + if (cinematicOn) ToneColorMath.CINEMATIC_VIBRANCY_OFFSET else 0f + if (isCustomNightSight) 0.12f else 0f)
             .coerceIn(-1f, 1f)
         val baseLocalContrast = (config.localToneMapping * hdrStrength * 0.24f).coerceIn(0f, 0.35f)
         val backlightClarityFactor = if (isBacklightActive && !nightSightEnabled) (config.backlightShadowClarity * 0.45f).coerceIn(0f, 0.65f) else 0f
@@ -538,8 +552,13 @@ class HdrPlusEngine {
                         var g = ((p shr 8) and 0xFF) * (1f / 255f) * wbG * evGain
                         var b = (p and 0xFF) * (1f / 255f) * wbB * evGain
 
-                        val luma = (0.299f * r + 0.587f * g + 0.114f * b).coerceIn(0.0001f, 1.5f)
-                        var mappedLuma = luma.coerceIn(0f, 1f)
+                        val luma = (0.299f * r + 0.587f * g + 0.114f * b).coerceIn(0.0001f, 2.5f)
+                        var mappedLuma = if (isCustomNightSight && luma > 0.76f) {
+                            val excess = luma - 0.76f
+                            (0.76f + 0.24f * (excess / (0.24f + excess))).coerceIn(0f, 1f)
+                        } else {
+                            luma.coerceIn(0f, 1f)
+                        }
 
                         if (lowLuma != null && edgeStopLut != null) {
                             val fx = x * xScale
@@ -626,8 +645,13 @@ class HdrPlusEngine {
                         val g = ((p shr 8) and 0xFF) * (1f / 255f) * wbG * evGain
                         val b = (p and 0xFF) * (1f / 255f) * wbB * evGain
 
-                        val luma = (0.299f * r + 0.587f * g + 0.114f * b).coerceIn(0.0001f, 1.5f)
-                        var mappedLuma = luma.coerceIn(0f, 1f)
+                        val luma = (0.299f * r + 0.587f * g + 0.114f * b).coerceIn(0.0001f, 2.5f)
+                        var mappedLuma = if (isCustomNightSight && luma > 0.76f) {
+                            val excess = luma - 0.76f
+                            (0.76f + 0.24f * (excess / (0.24f + excess))).coerceIn(0f, 1f)
+                        } else {
+                            luma.coerceIn(0f, 1f)
+                        }
 
                         if (lowLuma != null && edgeStopLut != null) {
                             val fx = x * xScale
@@ -1476,37 +1500,56 @@ class HdrPlusEngine {
         }
     }
 
+    private data class LumaStats(
+        val mean: Float,
+        val p92: Float,
+        val p96: Float,
+        val clippedPercent: Float,
+    )
+
     /**
-     * Fast subsampled luminance statistics (mean + 92nd percentile) for adaptive Night Sight gain.
+     * Fast subsampled luminance statistics (mean, p92, p96, and clipped-highlight %) for adaptive
+     * Night Sight gain & highlight protection.
      */
-    private fun estimateLumaStats(pixels: IntArray, width: Int, height: Int): Pair<Float, Float> {
+    private fun estimateLumaStats(pixels: IntArray, width: Int, height: Int): LumaStats {
         val bins = IntArray(64)
         val stepX = max(1, width / 64)
         val stepY = max(1, height / 64)
         var sum = 0f
+        var clipped = 0
         var count = 0
         for (y in 0 until height step stepY) {
             val row = y * width
             for (x in 0 until width step stepX) {
-                val luma = lumaOf(pixels[row + x]) * (1f / 255f)
+                val rawLuma = lumaOf(pixels[row + x])
+                if (rawLuma >= 246f) clipped++
+                val luma = rawLuma * (1f / 255f)
                 sum += luma
                 bins[(luma * 63f).toInt().coerceIn(0, 63)]++
                 count++
             }
         }
-        if (count == 0) return 0.2f to 0.5f
+        if (count == 0) return LumaStats(mean = 0.2f, p92 = 0.5f, p96 = 0.6f, clippedPercent = 0f)
         val mean = (sum / count).coerceIn(0f, 1f)
         val p92Target = (count * 0.92f).toInt()
+        val p96Target = (count * 0.96f).toInt()
         var acc = 0
         var p92 = 0.8f
+        var p96 = 0.85f
+        var found92 = false
         for (b in 0 until 64) {
             acc += bins[b]
-            if (acc >= p92Target) {
+            if (!found92 && acc >= p92Target) {
                 p92 = (b + 0.5f) / 64f
+                found92 = true
+            }
+            if (acc >= p96Target) {
+                p96 = (b + 0.5f) / 64f
                 break
             }
         }
-        return mean to p92
+        val clippedPct = (clipped * 100f / count).coerceIn(0f, 100f)
+        return LumaStats(mean = mean, p92 = p92, p96 = p96, clippedPercent = clippedPct)
     }
 
     private fun cloneNativeGainmapIfPresent(bitmap: Bitmap): Gainmap? {

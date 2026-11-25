@@ -172,11 +172,14 @@ class CameraController(private val context: Context) {
     @Volatile
     private var lastAfState: Int = CaptureResult.CONTROL_AF_STATE_INACTIVE
     @Volatile
+    private var lastAeMode: Int? = null
+    @Volatile
     private var lastSensorIso: Int? = null
     @Volatile
     private var lastPostRawBoost: Int = 100
     @Volatile
     private var lastExposureTimeNs: Long? = null
+    private val previewResultSeq = java.util.concurrent.atomic.AtomicLong(0L)
     @Volatile
     private var lowLightBoostEnabled: Boolean = false
     @Volatile
@@ -217,6 +220,22 @@ class CameraController(private val context: Context) {
             (iso * (lastPostRawBoost.coerceIn(100, 1600) / 100.0)).roundToInt()
         }
         return effectiveIso to lastExposureTimeNs
+    }
+
+    /**
+     * Returns DRC-safe baseline sensor ISO and exposure time for manual `CONTROL_AE_MODE_OFF`
+     * Night Sight capture without over-multiplying Pixel / Low Light Boost post-RAW gain.
+     */
+    private fun getManualBaselineExposure(lowLightBoostWasActive: Boolean): Pair<Int?, Long?> {
+        val baselineIso = lastSensorIso?.let { iso ->
+            LowLightDetector.computeManualBaselineIso(
+                sensorIso = iso,
+                postRawSensitivityBoost = lastPostRawBoost,
+                postRawBoostSupported = currentCapabilities.postRawBoostSupported,
+                lowLightBoostActive = lowLightBoostWasActive,
+            )
+        }
+        return baselineIso to lastExposureTimeNs
     }
 
     /**
@@ -318,9 +337,11 @@ class CameraController(private val context: Context) {
         val activeExtensionMode = mapExtensionModeInt(resolvedExtensionModeInt)
 
         lastAfState = CaptureResult.CONTROL_AF_STATE_INACTIVE
+        lastAeMode = null
         lastSensorIso = null
         lastPostRawBoost = 100
         lastExposureTimeNs = null
+        previewResultSeq.set(0L)
         lowLightBoostEnabled = false
         hasActiveFocusMetering = false
         hasActiveCamera2Overrides = false
@@ -634,6 +655,9 @@ class CameraController(private val context: Context) {
                 result.get(CaptureResult.CONTROL_AF_STATE)?.let { afState ->
                     lastAfState = afState
                 }
+                result.get(CaptureResult.CONTROL_AE_MODE)?.let { aeMode ->
+                    lastAeMode = aeMode
+                }
                 result.get(CaptureResult.SENSOR_SENSITIVITY)?.let { iso ->
                     if (iso > 0) lastSensorIso = iso
                 }
@@ -643,6 +667,7 @@ class CameraController(private val context: Context) {
                 result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { expNs ->
                     if (expNs > 0L) lastExposureTimeNs = expNs
                 }
+                previewResultSeq.incrementAndGet()
 
                 if (!activeFaceDetectEnabled) return
                 val now = System.currentTimeMillis()
@@ -793,6 +818,32 @@ class CameraController(private val context: Context) {
             },
             ContextCompat.getMainExecutor(context),
         )
+    }
+
+    /**
+     * Suspends until CameraX finishes toggling Low Light Boost so subsequent Camera2Interop
+     * `CONTROL_AE_MODE_OFF` overrides never race with an in-flight LLB repeating-request update.
+     */
+    private suspend fun setLowLightBoostEnabledAndAwait(enabled: Boolean) {
+        val camera = boundCamera ?: return
+        if (currentCapabilities.activeExtensionMode != PixelExtensionMode.NONE) return
+        if (!currentCapabilities.lowLightBoostSupported) return
+        if (lowLightBoostEnabled == enabled) return
+        lowLightBoostEnabled = enabled
+        val future = camera.cameraControl.enableLowLightBoostAsync(enabled)
+        withTimeoutOrNull(250L) {
+            suspendCancellableCoroutine<Unit> { cont ->
+                future.addListener(
+                    {
+                        runCatching { future.get() }.onFailure {
+                            if (enabled) lowLightBoostEnabled = false
+                        }
+                        if (cont.isActive) cont.resume(Unit)
+                    },
+                    ContextCompat.getMainExecutor(context),
+                )
+            }
+        }
     }
 
     @OptIn(ExperimentalCamera2Interop::class, ExperimentalZeroShutterLag::class)
@@ -1599,23 +1650,31 @@ class CameraController(private val context: Context) {
                 isAeAfLocked = isAeAfLocked,
             )
 
-            val (effectiveHwIso, effectiveHwExpNs) = getLatestHardwareExposure()
+            val previousLlbEnabled = lowLightBoostEnabled
+            val (baselineIso, baselineExpNs) = getManualBaselineExposure(
+                lowLightBoostWasActive = previousLlbEnabled,
+            )
             var activePlan = LowLightDetector.planLongExposure(
                 severity = lowLightSeverity,
                 meanLuma = meanLuma,
-                currentIso = effectiveHwIso,
-                currentExposureNs = effectiveHwExpNs,
+                currentIso = baselineIso,
+                currentExposureNs = baselineExpNs,
                 isoRange = caps.isoRange,
                 exposureTimeRangeNs = caps.exposureTimeRangeNs,
                 clippedHighlightPercent = clippedHighlightPercent,
+                manualEvCompensation = manualSettings.exposureCompensationEv,
             )
 
-            val previousLlbEnabled = lowLightBoostEnabled
             if (previousLlbEnabled) {
-                setLowLightBoostEnabled(false)
+                setLowLightBoostEnabledAndAwait(false)
             }
 
-            val useManualLongShutter = caps.manualSensorSupported && !manualSettings.isManualExposureActive
+            // Only engage manual CONTROL_AE_MODE_OFF when we have real metered hardware telemetry;
+            // otherwise stay on AE long-FPS burst so we never blind-fire an overexposed guess.
+            val useManualLongShutter = caps.manualSensorSupported &&
+                !manualSettings.isManualExposureActive &&
+                baselineIso != null &&
+                baselineExpNs != null
             var appliedOverride = applyNightSightHardwareRequest(
                 camera = camera,
                 caps = caps,
@@ -1623,6 +1682,7 @@ class CameraController(private val context: Context) {
                 plan = activePlan,
                 useManualLongShutter = useManualLongShutter,
             )
+            var seqAfterApply = previewResultSeq.get()
 
             val isFront = currentLensFacing == CameraSelector.LENS_FACING_FRONT
             val mirror = isFront && mirrorFrontCamera
@@ -1631,29 +1691,44 @@ class CameraController(private val context: Context) {
             var capturedCount = 0
             var lastFrameTimestampNs = -1L
 
-            suspend fun waitForExposureSettle(targetExposureNs: Long) {
+            suspend fun waitForExposureSettle(
+                targetExposureNs: Long,
+                targetIso: Int,
+                minResultSeq: Long,
+            ) {
                 if (!appliedOverride) return
-                val targetExpMs = (targetExposureNs / 1_000_000L).coerceIn(50L, 280L)
+                val targetExpMs = (targetExposureNs / 1_000_000L).coerceIn(40L, 280L)
                 if (useManualLongShutter) {
-                    val settleDeadline = System.currentTimeMillis() + (targetExpMs + 90L).coerceAtMost(320L)
+                    val settleDeadline = System.currentTimeMillis() + (targetExpMs * 2L + 140L).coerceIn(240L, 680L)
                     while (System.currentTimeMillis() < settleDeadline) {
+                        val hasFreshResult = previewResultSeq.get() > minResultSeq
+                        val aeOk = lastAeMode == null || lastAeMode == CameraMetadata.CONTROL_AE_MODE_OFF
                         val liveExp = lastExposureTimeNs
-                        if (liveExp != null && kotlin.math.abs(liveExp - targetExposureNs) <= (targetExposureNs * 0.30f).toLong()) {
+                        val liveIso = lastSensorIso
+                        val expOk = liveExp != null &&
+                            kotlin.math.abs(liveExp - targetExposureNs) <= (targetExposureNs * 0.25f).toLong().coerceAtLeast(1_500_000L)
+                        val isoOk = liveIso != null &&
+                            kotlin.math.abs(liveIso - targetIso) <= (targetIso * 0.25f).roundToInt().coerceAtLeast(15)
+                        if (hasFreshResult && aeOk && expOk && isoOk) {
                             break
                         }
                         delay(20L)
                     }
                 } else {
-                    delay(160L)
+                    delay(180L)
                 }
             }
 
             try {
-                waitForExposureSettle(activePlan.perFrameExposureNs)
+                waitForExposureSettle(
+                    targetExposureNs = activePlan.perFrameExposureNs,
+                    targetIso = activePlan.targetIso,
+                    minResultSeq = seqAfterApply,
+                )
 
                 val targetHoldMs = activePlan.estimatedTotalHoldMs.coerceAtLeast(800L)
                 // Hard real-time ceiling so even a slow HAL never traps the user for 10-60s
-                val maxHoldBudgetMs = (targetHoldMs + 1400L).coerceIn(2800L, 4200L)
+                var maxHoldBudgetMs = (targetHoldMs + 1400L).coerceIn(2800L, 4200L)
                 var minInterFrameMs = (activePlan.perFrameExposureNs / 1_000_000L).coerceIn(60L, 240L)
 
                 coroutineScope {
@@ -1670,7 +1745,7 @@ class CameraController(private val context: Context) {
                     }
 
                     try {
-                        var didClosedLoopCorrection = false
+                        var correctionAttempts = 0
                         while (rawFrames.size < activePlan.frameCount) {
                             val frameStartMs = System.currentTimeMillis()
                             var imageProxy = takeSingleImageProxy(imageCapture)
@@ -1687,25 +1762,32 @@ class CameraController(private val context: Context) {
                             }
                             val frameElapsed = System.currentTimeMillis() - frameStartMs
 
-                            // Closed-loop auto-metering on Frame 1 (only when the HAL is fast enough
-                            // that discarding 1 probe frame stays well within our handheld time budget).
-                            if (!didClosedLoopCorrection && rawFrames.isEmpty() && appliedOverride && frameElapsed < 1400L) {
-                                didClosedLoopCorrection = true
-                                val (frameLuma, frameClippedPct) = withContext(Dispatchers.Default) {
+                            // Closed-loop auto-metering on probe frames (up to 2 rapid corrections):
+                            // catches Pixel/OEM ISP digital gain differences or highlight clipping before
+                            // committing frames to the merge stack.
+                            if (correctionAttempts < 2 && rawFrames.isEmpty() && appliedOverride && frameElapsed < 2400L) {
+                                val stats = withContext(Dispatchers.Default) {
                                     measureQuickFrameBrightness(frame)
                                 }
-                                val isOverexposed = frameLuma > 0.54f || frameClippedPct > 14f
-                                val isSeverelyUnderexposed = frameLuma < 0.09f && frameClippedPct < 1f
+                                val isOverexposed = stats.meanLuma > 0.43f ||
+                                    stats.clippedPercent > 4.5f ||
+                                    (stats.p95Luma > 0.94f && stats.meanLuma > 0.34f)
+                                val isSeverelyUnderexposed = correctionAttempts == 0 &&
+                                    stats.meanLuma < 0.10f &&
+                                    stats.clippedPercent < 0.8f
                                 if (isOverexposed || isSeverelyUnderexposed) {
+                                    correctionAttempts++
                                     val linearScale = if (isOverexposed) {
-                                        val ratio = (0.34f / frameLuma.coerceAtLeast(0.36f)).coerceIn(0.20f, 0.86f)
-                                        val clipPenalty = if (frameClippedPct > 14f) {
-                                            (1f - ((frameClippedPct - 14f) / 38f)).coerceIn(0.45f, 0.88f)
+                                        val lumaRatio = (0.28f / stats.meanLuma.coerceAtLeast(0.30f)).coerceIn(0.22f, 0.92f)
+                                        val lumaScale = lumaRatio * lumaRatio
+                                        val clipScale = if (stats.clippedPercent > 4.5f) {
+                                            (1f - ((stats.clippedPercent - 4.5f) / 30f)).coerceIn(0.25f, 0.85f)
                                         } else 1f
-                                        (ratio * ratio * clipPenalty).coerceIn(0.14f, 0.80f)
+                                        val heavyClipBoost = if (stats.clippedPercent > 15f) 0.70f else 1f
+                                        (minOf(lumaScale, clipScale) * heavyClipBoost).coerceIn(0.06f, 0.75f)
                                     } else {
-                                        val ratio = (0.28f / frameLuma.coerceAtLeast(0.05f)).coerceIn(1.1f, 1.55f)
-                                        (ratio * ratio).coerceIn(1.2f, 2.0f)
+                                        val ratio = (0.24f / stats.meanLuma.coerceAtLeast(0.05f)).coerceIn(1.1f, 1.50f)
+                                        (ratio * ratio).coerceIn(1.2f, 1.85f)
                                     }
                                     activePlan = scalePlanExposure(
                                         plan = activePlan,
@@ -1721,7 +1803,13 @@ class CameraController(private val context: Context) {
                                         plan = activePlan,
                                         useManualLongShutter = useManualLongShutter,
                                     )
-                                    waitForExposureSettle(activePlan.perFrameExposureNs)
+                                    seqAfterApply = previewResultSeq.get()
+                                    waitForExposureSettle(
+                                        targetExposureNs = activePlan.perFrameExposureNs,
+                                        targetIso = activePlan.targetIso,
+                                        minResultSeq = seqAfterApply,
+                                    )
+                                    maxHoldBudgetMs = (maxHoldBudgetMs + 750L).coerceAtMost(5400L)
                                     // Discard the mis-exposed probe frame so it doesn't contaminate the merge
                                     frame.release()
                                     continue
@@ -1802,19 +1890,26 @@ class CameraController(private val context: Context) {
         return plan.copy(
             perFrameExposureNs = newExpNs,
             targetIso = newIso,
-            evBoostStops = (plan.evBoostStops + deltaEv).coerceIn(-1.5f, 1.5f),
+            evBoostStops = (plan.evBoostStops + deltaEv).coerceIn(-2.5f, 1.0f),
         )
     }
 
-    private fun measureQuickFrameBrightness(frame: RawCapturedFrame): Pair<Float, Float> {
+    private data class QuickBrightnessStats(
+        val meanLuma: Float,
+        val clippedPercent: Float,
+        val p95Luma: Float,
+    )
+
+    private fun measureQuickFrameBrightness(frame: RawCapturedFrame): QuickBrightnessStats {
         val ownsBmp = frame !is RawCapturedFrame.DecodedBitmap
         val bmp = decodeRawFrame(frame, maxLongEdge = 160)
         return try {
             val w = bmp.width
             val h = bmp.height
-            if (w <= 0 || h <= 0) return 0.34f to 0f
+            if (w <= 0 || h <= 0) return QuickBrightnessStats(0.28f, 0f, 0.5f)
             val px = IntArray(w * h)
             bmp.getPixels(px, 0, w, 0, 0, w, h)
+            val bins = IntArray(64)
             var sumLuma = 0.0
             var clipped = 0
             val step = (px.size / 1024).coerceAtLeast(1)
@@ -1827,13 +1922,30 @@ class CameraController(private val context: Context) {
                 val b = p and 0xFF
                 val luma = 0.299 * r + 0.587 * g + 0.114 * b
                 sumLuma += luma
+                bins[((luma / 255.0) * 63.0).toInt().coerceIn(0, 63)]++
                 if (luma >= 246.0) clipped++
                 count++
                 i += step
             }
-            if (count == 0) 0.34f to 0f
-            else ((sumLuma / (count * 255.0)).toFloat().coerceIn(0f, 1f)) to
-                ((clipped * 100f / count).coerceIn(0f, 100f))
+            if (count == 0) {
+                QuickBrightnessStats(0.28f, 0f, 0.5f)
+            } else {
+                val p95Target = (count * 0.95f).toInt()
+                var acc = 0
+                var p95 = 0.8f
+                for (bin in 0 until 64) {
+                    acc += bins[bin]
+                    if (acc >= p95Target) {
+                        p95 = (bin + 0.5f) / 64f
+                        break
+                    }
+                }
+                QuickBrightnessStats(
+                    meanLuma = (sumLuma / (count * 255.0)).toFloat().coerceIn(0f, 1f),
+                    clippedPercent = (clipped * 100f / count).coerceIn(0f, 100f),
+                    p95Luma = p95.coerceIn(0f, 1f),
+                )
+            }
         } finally {
             if (ownsBmp && !bmp.isRecycled) bmp.recycle()
         }
@@ -1862,7 +1974,7 @@ class CameraController(private val context: Context) {
                 )
                 builder.setCaptureRequestOption(
                     CaptureRequest.SENSOR_FRAME_DURATION,
-                    plan.perFrameExposureNs,
+                    maxOf(plan.perFrameExposureNs, 33_333_333L),
                 )
                 builder.setCaptureRequestOption(
                     CaptureRequest.SENSOR_SENSITIVITY,
@@ -1881,7 +1993,7 @@ class CameraController(private val context: Context) {
                         fpsRange,
                     )
                 }
-                val boostedEv = (manualSettings.exposureCompensationEv + plan.evBoostStops.coerceIn(-1.5f, 1.2f))
+                val boostedEv = (manualSettings.exposureCompensationEv + plan.evBoostStops.coerceIn(-2.5f, 0.75f))
                 val evIndex = (boostedEv / caps.evStep)
                     .roundToInt()
                     .coerceIn(caps.minEvIndex, caps.maxEvIndex)

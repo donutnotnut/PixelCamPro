@@ -192,4 +192,103 @@ class FaceAndNightSightTest {
         blurredFaceBmp.recycle()
         blurRes.bitmap.recycle()
     }
+
+    @Test
+    fun nightSight_baselineIsoDampsPixelPostRawAndLowLightBoost() {
+        // Pixel / Tensor HAL reporting ISO 1000 with 400 (4x) post-RAW DRC boost:
+        // linear multiplication would yield ISO 4000 (+2 stops overexposed in manual AE_OFF).
+        val normalManualIso = LowLightDetector.computeManualBaselineIso(
+            sensorIso = 1000,
+            postRawSensitivityBoost = 400,
+            postRawBoostSupported = true,
+            lowLightBoostActive = false,
+        )
+        assertTrue("Expected damped baseline ISO <= 1450, got $normalManualIso", normalManualIso in 1000..1450)
+
+        // When Low Light Boost was active during preview, damping must be even tighter
+        val llbManualIso = LowLightDetector.computeManualBaselineIso(
+            sensorIso = 1000,
+            postRawSensitivityBoost = 800,
+            postRawBoostSupported = true,
+            lowLightBoostActive = true,
+        )
+        assertTrue("Expected LLB-damped baseline ISO <= 1150, got $llbManualIso", llbManualIso in 1000..1150)
+
+        // When post-RAW boost control isn't supported, keep raw sensor ISO untouched
+        val unsupportedIso = LowLightDetector.computeManualBaselineIso(
+            sensorIso = 1000,
+            postRawSensitivityBoost = 400,
+            postRawBoostSupported = false,
+            lowLightBoostActive = false,
+        )
+        assertEquals(1000, unsupportedIso)
+    }
+
+    @Test
+    fun nightSight_protectsHighlightsAndPullsBackOverexposedScenes() = runTest {
+        // 1. Planner respects manual negative EV and clipped highlights
+        val neutralPlan = LowLightDetector.planLongExposure(
+            severity = 0.75f,
+            meanLuma = 0.16f,
+            currentIso = 1200,
+            currentExposureNs = 33_333_333L,
+            isoRange = 50..6400,
+            exposureTimeRangeNs = 100_000L..1_000_000_000L,
+            clippedHighlightPercent = 0f,
+            manualEvCompensation = 0f,
+        )
+        val negEvPlan = LowLightDetector.planLongExposure(
+            severity = 0.75f,
+            meanLuma = 0.16f,
+            currentIso = 1200,
+            currentExposureNs = 33_333_333L,
+            isoRange = 50..6400,
+            exposureTimeRangeNs = 100_000L..1_000_000_000L,
+            clippedHighlightPercent = 0f,
+            manualEvCompensation = -1.0f,
+        )
+        val neutralProduct = neutralPlan.targetIso.toDouble() * neutralPlan.perFrameExposureNs.toDouble()
+        val negEvProduct = negEvPlan.targetIso.toDouble() * negEvPlan.perFrameExposureNs.toDouble()
+        assertTrue(
+            "Negative EV must lower Night Sight exposure product (neg=$negEvProduct, neutral=$neutralProduct)",
+            negEvProduct < neutralProduct * 0.60
+        )
+
+        // 2. Engine pulls back moderately hot night frame (mean ~138/255 = 0.54) instead of leaving it washed out
+        val engine = HdrPlusEngine()
+        val w = 64
+        val h = 64
+        val moderatelyHot = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
+            for (y in 0 until h) {
+                for (x in 0 until w) {
+                    val v = if (x < 32) 128 else 150
+                    setPixel(x, y, Color.rgb(v, v, v))
+                }
+            }
+        }
+        val hotRes = engine.processBurst(
+            frames = listOf(moderatelyHot),
+            mode = CameraMode.CAMERA,
+            hdrMode = HdrMode.HDR_PLUS_ENHANCED,
+            manual = ManualExposureSettings(),
+            config = HdrPipelineConfig(sabreSharpening = 0f),
+            nightSightEnabled = true,
+            lowLightSeverity = 0.75f,
+            totalExposureSeconds = 1.4f,
+        )
+        var outSum = 0.0
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val p = hotRes.bitmap.getPixel(x, y)
+                outSum += 0.299 * Color.red(p) + 0.587 * Color.green(p) + 0.114 * Color.blue(p)
+            }
+        }
+        val outMean = outSum / (w * h)
+        assertTrue(
+            "Moderately hot night frame (in ~139) should be pulled down cleanly (got $outMean)",
+            outMean < 120.0
+        )
+        moderatelyHot.recycle()
+        hotRes.bitmap.recycle()
+    }
 }

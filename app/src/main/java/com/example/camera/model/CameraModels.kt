@@ -667,13 +667,39 @@ object LowLightDetector {
     }
 
     /**
+     * Converts Camera2 preview AE telemetry (`SENSOR_SENSITIVITY` + `CONTROL_POST_RAW_SENSITIVITY_BOOST`)
+     * into a conservative baseline sensor ISO suitable for manual `CONTROL_AE_MODE_OFF` capture.
+     *
+     * On Pixel / Tensor and DRC sensors, `CONTROL_POST_RAW_SENSITIVITY_BOOST` (often 200-1600,
+     * especially while Low Light Boost is active) represents ISP dynamic-range tone-mapped digital
+     * boost rather than pure linear headroom. Multiplying linearly by the full post-RAW boost
+     * drives physical sensor exposure 2-3+ stops too hot when switching to manual long shutter.
+     */
+    fun computeManualBaselineIso(
+        sensorIso: Int,
+        postRawSensitivityBoost: Int = 100,
+        postRawBoostSupported: Boolean = true,
+        lowLightBoostActive: Boolean = false,
+    ): Int {
+        val safeIso = sensorIso.coerceAtLeast(1)
+        if (!postRawBoostSupported || postRawSensitivityBoost <= 100) {
+            return safeIso
+        }
+        val maxFactor = if (lowLightBoostActive) 1.15 else 1.45
+        val dampedFactor = kotlin.math.sqrt(postRawSensitivityBoost.coerceIn(100, 1600) / 100.0)
+            .coerceIn(1.0, maxFactor)
+        return (safeIso * dampedFactor).toInt().coerceAtLeast(safeIso)
+    }
+
+    /**
      * Computes handheld Pixel-style long-exposure parameters using exposure equivalence:
      * - Automatically measures how much additional light the scene actually needs based on
      *   current preview luminance (`meanLuma`) and highlight clipping (`clippedHighlightPercent`).
      * - When AE already exposed the scene properly via high noisy ISO, extends shutter speed while
      *   proportionally LOWERING ISO (same brightness, dramatically less noise, zero overexposure).
-     * - When the scene is genuinely underexposed (`meanLuma < 0.34`), boosts total exposure only by
-     *   the exact amount needed while capping shutter time so `isoRange.first` never forces overexposure.
+     * - When the scene is genuinely underexposed (`meanLuma < 0.28`), boosts total exposure
+     *   conservatively to preserve sensor highlight headroom, while capping shutter time so
+     *   `isoRange.first` never forces overexposure.
      */
     fun planLongExposure(
         severity: Float,
@@ -683,6 +709,7 @@ object LowLightDetector {
         isoRange: IntRange,
         exposureTimeRangeNs: LongRange,
         clippedHighlightPercent: Float = 0f,
+        manualEvCompensation: Float = 0f,
     ): LowLightExposurePlan {
         val clampedSeverity = severity.coerceIn(0.15f, 1f)
         val safeLuma = meanLuma.coerceIn(0.05f, 0.95f)
@@ -694,30 +721,42 @@ object LowLightDetector {
             else -> 3
         }
 
-        // Target balanced night luminance (~0.34 sRGB): clear and bright without washing out or clipping
-        val targetLuma = 0.34f
+        // Target natural night luminance (~0.28 sRGB): preserves deep night ambience and highlight
+        // headroom on the sensor so multi-frame stacking + soft shadow lift never blows out lights.
+        val targetLuma = 0.28f
         val rawLinearGain = if (safeLuma >= targetLuma) {
             // Scene already has enough brightness — use longer shutter ONLY to drop ISO & reduce noise!
             1.0f
         } else {
-            // sRGB -> linear approximation (conservative exponent 1.8 avoids overshooting)
-            (targetLuma / safeLuma).pow(1.8f).coerceIn(1.0f, 2.5f)
+            // Conservative linear boost (max +0.81 EV) so bright lamps/walls never hard-clip on sensor
+            (targetLuma / safeLuma).pow(1.5f).coerceIn(1.0f, 1.75f)
         }
 
         // Protect bright lamps / windows / screens in the frame from blowing out
-        val highlightDamp = if (clippedHighlightPercent > 1.5f) {
-            (1f - ((clippedHighlightPercent - 1.5f) / 10f)).coerceIn(0.15f, 1f)
+        val highlightDamp = if (clippedHighlightPercent > 0.5f) {
+            (1f - ((clippedHighlightPercent - 0.5f) / 6.5f)).coerceIn(0.05f, 1f)
         } else {
             1.0f
         }
-        val desiredLinearGain = (1.0f + (rawLinearGain - 1.0f) * highlightDamp).coerceIn(1.0f, 2.5f)
+        val clipPullback = if (clippedHighlightPercent > 6f) {
+            (1f - ((clippedHighlightPercent - 6f) / 30f)).coerceIn(0.65f, 1f)
+        } else {
+            1.0f
+        }
+        val desiredLinearGain = ((1.0f + (rawLinearGain - 1.0f) * highlightDamp) * clipPullback)
+            .coerceIn(0.65f, 1.75f)
 
         val baseIso = (currentIso ?: ((500f + clampedSeverity * 1500f).toInt()))
             .coerceIn(isoRange.first, isoRange.last)
         val baseExpNs = (currentExposureNs ?: 33_333_333L).coerceAtLeast(500_000L)
+        val userEvScale = if (manualEvCompensation != 0f) {
+            2f.pow(manualEvCompensation.coerceIn(-2.5f, 2.5f)).toDouble()
+        } else {
+            1.0
+        }
 
         // Desired total sensor exposure product (ISO * ns)
-        val desiredProduct = baseIso.toDouble() * baseExpNs.toDouble() * desiredLinearGain.toDouble()
+        val desiredProduct = baseIso.toDouble() * baseExpNs.toDouble() * desiredLinearGain.toDouble() * userEvScale
 
         // Preferred handheld long shutter (100ms in dim light up to 280ms in pitch dark)
         val minIso = isoRange.first.coerceAtLeast(25)
@@ -738,8 +777,8 @@ object LowLightDetector {
         val targetIso = idealIso.coerceIn(minIso, maxNightIso)
 
         val actualProduct = targetIso.toDouble() * desiredExposureNs.toDouble()
-        val effectiveGain = (actualProduct / (baseIso.toDouble() * baseExpNs.toDouble())).coerceAtLeast(1.0)
-        val evBoostStops = (ln(effectiveGain) / ln(2.0)).toFloat().coerceIn(0f, 1.5f)
+        val effectiveGain = (actualProduct / (baseIso.toDouble() * baseExpNs.toDouble())).coerceAtLeast(0.25)
+        val evBoostStops = (ln(effectiveGain) / ln(2.0)).toFloat().coerceIn(-1.5f, 1.0f)
 
         // Account for per-frame exposure + fast MINIMIZE_LATENCY readout overhead (~90ms per frame)
         val perFrameCycleMs = (desiredExposureNs / 1_000_000L) + 90L
